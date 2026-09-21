@@ -18,10 +18,20 @@ App → http://127.0.0.1:3000 · API → http://127.0.0.1:8001/docs
 ## Run with Docker (single service, serves API + frontend)
 ```bash
 cd alpha-swarm
-npm install && npm run build   # frontend bundle goes into dist/
 docker compose up -d --build
 ```
-App + API → http://127.0.0.1:8001 (API docs at /docs)
+App + API → http://127.0.0.1:8001 (API docs at /docs).
+The image builds the React bundle inside Docker — no local `dist/` needed.
+
+## Deploy on Render (Docker runtime — recommended)
+1. Render dashboard → New → **Web Service** → select `varunshah5698/AlphaSwarm`
+2. **Runtime: Docker** (NOT Node — Node builds only the UI and the API stays dead,
+   which is exactly the `vite: not found` failure: dependencies were never installed)
+3. Add env vars: `SESSION_TTL_DAYS=7`, `FINNHUB_API_KEY=<your key>`
+   (Render injects `$PORT` itself; the server listens on it automatically)
+4. Deploy → one URL serves the full app + API + docs.
+> Do NOT use Render's Node runtime for this repo: `npm run build` alone fails
+> without `npm ci` first, and even then the Python API would be missing.
 
 ## 3-minute demo script
 1. `/register` — create account (username + email + password) → sign in.
