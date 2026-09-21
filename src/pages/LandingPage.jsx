@@ -97,6 +97,14 @@ const SECURITY = [
 ];
 
 export default function LandingPage() {
+  // Animated loop: steps cycle 1→6 on a timer; footer numbers are real lab stats.
+  const [liveStep, setLiveStep] = useState(0);
+  const [lab, setLab] = useState(null);
+  useEffect(() => {
+    const id = setInterval(() => setLiveStep((s) => (s + 1) % STEPS.length), 1300);
+    api.publicStats().then(setLab).catch(() => {});
+    return () => clearInterval(id);
+  }, []);
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg)', width: '100%', flex: 1, alignSelf: 'stretch' }}>
       {/* ---------- nav ---------- */}
@@ -140,24 +148,31 @@ export default function LandingPage() {
           <div className="pv-card" style={{ padding: '1.5rem' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <b style={{ fontFamily: 'var(--font-display)' }}>The loop</b>
-              <span className="pv-badge" style={{ background: 'var(--success-light)' }}><span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: 'var(--success)', marginRight: '.35rem' }} />RUNNING</span>
+              <span className="pv-badge" style={{ background: 'var(--success-light)' }}><span className="pv-pulse" style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: 'var(--success)', marginRight: '.35rem' }} />RUNNING</span>
             </div>
             <div style={{ position: 'relative', paddingLeft: '1.9rem' }}>
-              <div style={{ position: 'absolute', left: 11, top: 8, bottom: 8, width: 2, background: 'var(--border)' }} />
+              <div style={{ position: 'absolute', left: 11, top: 8, bottom: 8, width: 2, background: 'var(--border)', borderRadius: 2 }} />
+              <div style={{ position: 'absolute', left: 11, top: 8, width: 2, borderRadius: 2, background: 'var(--success)', transition: 'height .5s ease', height: `calc(${((liveStep + 1) / STEPS.length) * 100}% - 16px)` }} />
               {STEPS.map(([t, d, icon], i) => {
                 const I = Icon[icon];
+                const active = i === liveStep;
+                const done = i < liveStep;
                 return (
-                  <div key={t} style={{ position: 'relative', display: 'flex', gap: '.8rem', padding: '.5rem 0', alignItems: 'flex-start' }}>
-                    <div style={{ position: 'absolute', left: '-1.9rem', width: 24, height: 24, borderRadius: '50%', background: i === 0 ? 'var(--pv-lime)' : '#fff', border: '1.5px solid var(--pv-ink)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--pv-ink)' }}>
+                  <div key={t} style={{ position: 'relative', display: 'flex', gap: '.8rem', padding: '.5rem 0', alignItems: 'flex-start', opacity: done || active ? 1 : 0.45, transition: 'opacity .4s ease' }}>
+                    <div style={{ position: 'absolute', left: '-1.9rem', width: 24, height: 24, borderRadius: '50%', background: active ? 'var(--pv-lime)' : done ? 'var(--success-light)' : '#fff', border: '1.5px solid var(--pv-ink)', boxShadow: active ? '0 0 0 4px rgba(185,255,102,.45), 2px 2px 0 #101a13' : 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--pv-ink)', transition: 'all .4s ease' }}>
                       <I style={{ width: 13, height: 13 }} />
                     </div>
                     <div>
-                      <div style={{ fontWeight: 700, fontSize: '.86rem' }}><span style={{ color: 'var(--text-muted)', fontWeight: 600, marginRight: '.4rem' }}>{i + 1}</span>{t}</div>
+                      <div style={{ fontWeight: 700, fontSize: '.86rem' }}><span style={{ color: 'var(--text-muted)', fontWeight: 600, marginRight: '.4rem' }}>{i + 1}</span>{t}{active && <span style={{ marginLeft: '.5rem', fontSize: '.68rem', fontWeight: 800, color: 'var(--success)' }}>● WORKING</span>}</div>
                       <div style={{ fontSize: '.78rem', color: 'var(--text-secondary)' }}>{d}</div>
                     </div>
                   </div>
                 );
               })}
+            </div>
+            <div style={{ marginTop: '.9rem', paddingTop: '.8rem', borderTop: '1.5px solid var(--border)', fontSize: '.76rem', color: 'var(--text-secondary)', display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '.4rem' }}>
+              <span>{lab ? `${lab.experiments} cycles completed` : 'connecting to lab…'}</span>
+              <span>{lab && lab.best_sharpe != null ? `best Sharpe ${lab.best_sharpe >= 0 ? '+' : ''}${lab.best_sharpe}` : ''}</span>
             </div>
           </div>
         </div>

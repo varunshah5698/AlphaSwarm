@@ -583,6 +583,8 @@ textarea.pv-input { resize: vertical; line-height: 1.6; }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes page-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pv-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.8); } }
+.pv-pulse { animation: pv-pulse 1.3s ease-in-out infinite; }
 .fade-in, .ui-page { animation: page-in .32s ease; }
 .spin { animation: spin .8s linear infinite; }
 @media (prefers-reduced-motion: reduce) {
