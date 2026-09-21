@@ -1,0 +1,18 @@
+services:
+  alpha-swarm:
+    build: .
+    ports:
+      - "${PORT:-8001}:8001"
+    environment:
+      - PORT=8001
+      - SESSION_TTL_DAYS=${SESSION_TTL_DAYS:-7}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# SQLite lives in the container. Back it up with:
+#   docker cp $(docker compose ps -q alpha-swarm):/app/backend/alpha_swarm.db ./alpha_swarm_backup.db
