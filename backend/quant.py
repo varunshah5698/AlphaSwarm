@@ -1,11 +1,12 @@
 """Quant engine: synthetic market data, Writer/Judge agents, vector backtest."""
+import itertools
 import numpy as np
 import pandas as pd
 import hashlib
 import re
 
 # Engine version — bump when market dynamics change so stored metrics are recomputed.
-ENGINE_VERSION = 2
+ENGINE_VERSION = 3
 
 # ---------- market data ----------
 
@@ -125,8 +126,10 @@ def _run_backtest(df: pd.DataFrame, formula: str, costs_bps: int, slippage_bps: 
     dd = (equity / roll_max - 1).min() * 100
     wins = (strat_ret[pos != 0] > 0).mean() * 100 if (pos != 0).any() else 0
     trades = int((turnover > 0.05).sum())
-    step = max(1, len(equity) // 252)
-    curve = [{"t": int(i), "v": round(float(v), 4)} for i, v in enumerate(equity.iloc[::step])]
+    # Full-resolution curve: every bar is stored so analytics windows can slice
+    # real trading-day ranges later. Downsampling for display happens at the API
+    # layer, never in storage.
+    curve = [{"t": int(i), "v": round(float(v), 4)} for i, v in enumerate(equity)]
     # buy & hold baseline for the same dataset
     bh = (1 + ret).cumprod()
     bh_ret = round(float((bh.iloc[-1] - 1) * 100), 2)
@@ -264,3 +267,163 @@ def judge_review(formula: str, hypothesis: str = "") -> dict:
     score = max(0, min(100, score))
     verdict = "approve" if score >= 70 else ("revise" if score >= 50 else "reject")
     return {"score": score, "notes": " ".join(notes), "checks": checks, "verdict": verdict}
+
+
+def backtest_yahoo(symbol: str, formula: str, costs_bps: int = 10, slippage_bps: int = 5, years: float = 10):
+    """Backtest a formula on real Yahoo daily bars (keyless, cached)."""
+    from yahoo_provider import fetch_bars, clean_symbol
+    s = clean_symbol(symbol)
+    df = fetch_bars(s, years=years)
+    out = _run_backtest(df, formula, costs_bps, slippage_bps)
+    out["dataset"] = f"YAHOO-{s}"
+    out["symbol"] = s
+    return out
+
+
+# ---------- learning: walk-forward train/test + parameter search ----------
+
+def train_test_split(df: pd.DataFrame, test_frac: float = 0.3):
+    """Chronological split — the model never sees the test segment in training."""
+    cut = int(len(df) * (1 - test_frac))
+    return df.iloc[:cut].reset_index(drop=True), df.iloc[cut:].reset_index(drop=True)
+
+
+def evaluate_oos(df: pd.DataFrame, formula: str, costs_bps: int = 10, slippage_bps: int = 5,
+                 test_frac: float = 0.3) -> dict:
+    """Same formula on train vs unseen test. The gap between the two is the
+    honesty metric: a big train/test Sharpe gap means overfit."""
+    tr, te = train_test_split(df, test_frac)
+    return {
+        "train": _run_backtest(tr, formula, costs_bps, slippage_bps),
+        "test": _run_backtest(te, formula, costs_bps, slippage_bps),
+        "train_bars": len(tr),
+        "test_bars": len(te),
+    }
+
+
+def _count_ops(formula: str) -> int:
+    return len(re.findall(r"(rank|delay|sma|ema|rsi|std|correlation|zscore|atr|sign|beta|avg)", formula.lower()))
+
+
+# Search space: 6 alpha families x parameter grids. Every candidate stays
+# within the 12-op complexity cap. Deterministic order => reproducible runs.
+LEARN_FAMILIES = [
+    ("Momentum Reversion",
+     ["rank(close / delay(close, {n}) - 1) * -1"],
+     {"n": [5, 10, 15, 20, 30, 40, 60]}),
+    ("RSI Reversion",
+     ["(50 - rsi(close, {n})) / 50",
+      "(50 - rsi(close, {n})) / 50 * rank(volume / sma(volume, 20))"],
+     {"n": [7, 14, 21, 28]}),
+    ("Trend EMA",
+     ["sign(ema(close, {a}) - ema(close, {b}))",
+      "sign(ema(close, {a}) - ema(close, {b})) * rank(volume / sma(volume, 20))"],
+     {"a": [5, 8, 12, 20], "b": [21, 26, 50]}),
+    ("Bollinger Reversion",
+     ["(sma(close, {n}) - close) / (std(close, {n}) + 0.001)",
+      "rank((sma(close, {n}) - close) / (std(close, {n}) + 0.001))"],
+     {"n": [10, 20, 30, 50]}),
+    ("Volume Drift",
+     ["correlation(volume, close, {n})",
+      "correlation(volume, close, {n}) * rank(close - delay(close, 5))"],
+     {"n": [10, 20, 30, 60]}),
+    ("Volatility Breakout",
+     ["rank(std(close, 10) / std(close, {n})) * sign(close - delay(close, 1))"],
+     {"n": [20, 30, 60]}),
+]
+
+
+def _enumerate_candidates(max_candidates: int = 150) -> list:
+    cands = []
+    for family, templates, grid in LEARN_FAMILIES:
+        keys = list(grid)
+        for vals in itertools.product(*(grid[k] for k in keys)):
+            params = dict(zip(keys, vals))
+            if params.get("a", -1) >= params.get("b", 10**9):
+                continue  # EMA fast must be faster than slow
+            for tpl in templates:
+                f = tpl.format(**params)
+                if _count_ops(f) > 12:
+                    continue
+                cands.append((family, f))
+            if len(cands) >= max_candidates:
+                break
+        if len(cands) >= max_candidates:
+            break
+    return cands
+
+
+def _select_best(cands: list, tr: pd.DataFrame, costs_bps: int, slippage_bps: int,
+                 penalty: float = 0.03) -> list:
+    """Score every candidate on a training slice. Returns ranked
+    [(score, family, formula, metrics)] — selection never sees test data."""
+    scored = []
+    for family, f in cands:
+        try:
+            m = _run_backtest(tr, f, costs_bps, slippage_bps)
+            if m["trades"] < 20:
+                continue  # degenerate: barely trades
+            score = m["sharpe"] - penalty * _count_ops(f)
+            scored.append((score, family, f, m))
+        except Exception:
+            continue
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
+
+def walk_forward(df: pd.DataFrame, costs_bps: int = 10, slippage_bps: int = 5,
+                 folds: int = 3, penalty: float = 0.03) -> dict:
+    """Re-select the winner on an expanding training window and test each on
+    the next unseen block. Consistent winners across folds = robust pattern;
+    winners that only work once = luck. This is the closest thing to
+    'would it have worked going forward' that history allows."""
+    n = len(df)
+    edges = [int(n * k / (folds + 1)) for k in range(folds + 2)]
+    cands = _enumerate_candidates()
+    results = []
+    for k in range(1, folds + 1):
+        tr = df.iloc[:edges[k]].reset_index(drop=True)
+        te = df.iloc[edges[k]:edges[k + 1]].reset_index(drop=True)
+        ranked = _select_best(cands, tr, costs_bps, slippage_bps, penalty)
+        if not ranked:
+            continue
+        _, family, formula, train_m = ranked[0]
+        test_m = _run_backtest(te, formula, costs_bps, slippage_bps)
+        results.append({"fold": k, "train_bars": len(tr), "test_bars": len(te),
+                        "winner": family, "formula": formula,
+                        "train_sharpe": train_m["sharpe"], "test_sharpe": test_m["sharpe"],
+                        "test_return": test_m["returns"]})
+    tests = [r["test_sharpe"] for r in results]
+    return {"folds": results,
+            "mean_test_sharpe": round(sum(tests) / len(tests), 2) if tests else 0.0,
+            "positive_folds": sum(1 for t in tests if t > 0),
+            "n_folds": len(results)}
+def learn(df: pd.DataFrame, hypothesis: str = "", costs_bps: int = 10, slippage_bps: int = 5,
+          test_frac: float = 0.3, penalty: float = 0.03, max_candidates: int = 150) -> dict:
+    """Genuine model selection: enumerate the candidate space, score each on
+    TRAIN only (Sharpe minus a per-op complexity penalty), report the winner
+    on the unseen TEST segment, then stress it with walk-forward folds.
+    Headline metrics are always test."""
+    tr, te = train_test_split(df, test_frac)
+    cands = _enumerate_candidates(max_candidates)
+    scored = _select_best(cands, tr, costs_bps, slippage_bps, penalty)
+    if not scored:
+        raise ValueError("Learning found no viable candidate on the training segment.")
+    score, family, formula, train_m = scored[0]
+    test_m = _run_backtest(te, formula, costs_bps, slippage_bps)
+    full_m = _run_backtest(df, formula, costs_bps, slippage_bps)
+    wf = walk_forward(df, costs_bps, slippage_bps, penalty=penalty)
+    code = (
+        f"# {family} (learned) — train Sharpe {train_m['sharpe']}, test Sharpe {test_m['sharpe']}\n"
+        f"# hypothesis: {hypothesis}\n"
+        f"# searched {len(cands)} candidates, {len(scored)} viable, test {len(te)}/{len(df)} bars unseen\n"
+        f"# walk-forward mean test Sharpe {wf['mean_test_sharpe']} ({wf['positive_folds']}/{wf['n_folds']} folds positive)\n"
+        f"signal = {formula}\n"
+        f"position = (signal / 3).clip(-1, 1).shift(1)  # next-bar, no look-ahead\n"
+    )
+    return {"name": f"{family} ·learned", "formula": formula, "code": code,
+            "train": train_m, "test": test_m, "full": full_m,
+            "walk_forward": wf,
+            "train_bars": len(tr), "test_bars": len(te),
+            "candidates": len(cands), "viable": len(scored),
+            "selection_score": round(score, 3)}

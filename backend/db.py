@@ -101,6 +101,10 @@ def init_db():
     if "ann_vol" not in cols:
         c.execute("ALTER TABLE strategies ADD COLUMN ann_vol REAL DEFAULT 0")
         c.commit()
+    # lightweight migration for DBs created before per-strategy dataset tags
+    if "dataset" not in cols:
+        c.execute("ALTER TABLE strategies ADD COLUMN dataset TEXT DEFAULT 'SYNTH-SPX-2014-2024'")
+        c.commit()
     # lightweight migration for DBs created before session expiry existed
     # (SQLite forbids non-constant defaults in ALTER TABLE, so backfill after.)
     sess_cols = [r["name"] for r in c.execute("PRAGMA table_info(sessions)").fetchall()]

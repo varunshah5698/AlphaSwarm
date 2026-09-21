@@ -13,9 +13,12 @@ const GROUPS = [
   {
     group: 'Lab',
     rows: [
-      ['POST', '/api/pipeline/run', '{ hypothesis, costs_bps, slippage_bps } → Writer + Judge + backtest'],
-      ['POST', '/api/backtest', '{ formula, costs_bps, slippage_bps } → metrics + equity curve'],
-      ['POST', '/api/backtest/csv', 'multipart: file + formula → backtest on your own OHLCV'],
+      ['POST', '/api/pipeline/run', '{ hypothesis, costs_bps, slippage_bps, symbol } → learn on real bars, train/test report'],
+      ['POST', '/api/backtest', '{ formula, costs_bps, slippage_bps, symbol } → metrics + equity curve + train/test'],
+      ['POST', '/api/backtest/csv', 'multipart: file + formula → backtest on your own OHLCV + train/test'],
+      ['POST', '/api/backtest/live', '{ symbol, formula, … } → real bars via keyless feed (Finnhub fallback)'],
+      ['POST', '/api/strategies/test-all', '{ symbol, … } → every stored factor on real bars, ranked'],
+      ['GET', '/api/market/candles?symbol=SPY', 'Real daily closes for charts (no key needed)'],
       ['GET', '/api/analytics?period=1Y', 'KPIs, period returns, scatter, rolling Sharpe, radar'],
     ],
   },

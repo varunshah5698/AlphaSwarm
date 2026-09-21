@@ -73,13 +73,13 @@ export default function BacktestPage() {
       <PageHeader
         eyebrow="Alpha lab"
         title="Backtesting engine"
-        sub="Next-bar execution with costs and slippage on every position change — synthetic market or your own OHLCV file."
+        sub="Next-bar execution with costs and slippage — synthetic lab, real market bars, or your own OHLCV file. Every run reports train vs unseen test."
         actions={<Segmented options={[['synthetic', 'Synthetic data'], ['live', 'Live market'], ['csv', 'My CSV']]} value={mode} onChange={(m) => { setMode(m); setOut(null); }} label="Data source" />}
       />
 
       {mode === 'live' && (
         <Card>
-          <CardHead title="Live symbol" sub="Real daily bars via Finnhub — cached 12h, 60+ bars required" icon="activity" />
+          <CardHead title="Live symbol" sub="Real daily bars — keyless feed, cached 12h, 60+ bars required" icon="activity" />
           <div className="ui-fields">
             <Field label="Ticker" hint="US stocks & ETFs, e.g. AAPL, SPY, NVDA">
               <input className="pv-input" value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())} placeholder="AAPL" maxLength={12} style={{ fontFamily: 'var(--font-mono)' }} />
@@ -182,6 +182,23 @@ export default function BacktestPage() {
             )}
             {out.bars ? <Kpi label="Bars tested" value={fmt.int(out.bars)} foot="after warm-up" /> : null}
           </KpiGrid>
+
+          {out.train && out.test && (
+            <Card>
+              <CardHead
+                title="Train vs unseen test"
+                sub={`Selected insight: the gap between train and test Sharpe is the overfit detector · test ${out.test_bars} bars`}
+                icon="shield"
+                actions={<Pill tone={out.test.sharpe >= 0.4 && out.train.sharpe - out.test.sharpe < 1 ? 'is-ok' : 'is-warn'} dot>{out.test.sharpe >= 0.4 && out.train.sharpe - out.test.sharpe < 1 ? 'generalizes' : 'overfit risk'}</Pill>}
+              />
+              <KpiGrid>
+                <Kpi label="Train Sharpe" value={fmt.num(out.train.sharpe)} foot={`${out.train_bars} bars · in-sample`} />
+                <Kpi label="Test Sharpe" value={fmt.num(out.test.sharpe)} foot={`${out.test_bars} bars · unseen`} tone={out.test.sharpe >= 1 ? 'tone-ok' : 'tone-warn'} />
+                <Kpi label="Test return" value={fmt.pct(out.test.returns)} />
+                <Kpi label="Test max DD" value={fmt.pct(out.test.max_dd)} tone="tone-bad" />
+              </KpiGrid>
+            </Card>
+          )}
 
           <Card>
             <CardHead

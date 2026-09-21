@@ -10,7 +10,7 @@ const LOOP = [
   ['Research / data ingestion', 'book'],
   ['Writer agent · hypothesis → formula + code', 'terminal'],
   ['Judge agent · leakage + logic review', 'shield'],
-  ['Backtest engine · 2520 bars with costs', 'chart'],
+  ['Learning · search candidates, test on unseen bars', 'chart'],
   ['Evaluation · Sharpe / drawdown / win-rate', 'bolt'],
   ['Feedback memory · store + learn', 'flask'],
 ];
@@ -29,7 +29,7 @@ export default function PipelinePage() {
   const [hyp, setHyp] = useState(PRESETS[0]);
   const [costs, setCosts] = useState(settings.transactionCost);
   const [slip, setSlip] = useState(settings.slippage);
-  const [symbol, setSymbol] = useState('');
+  const [symbol, setSymbol] = useState('AAPL');
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState(-1);
   const [result, setResult] = useState(null);
@@ -96,8 +96,8 @@ export default function PipelinePage() {
             <Field label="Slippage (bps)" hint="Added on top of costs">
               <input className="pv-input" type="number" min="0" max="500" value={slip} onChange={(e) => setSlip(e.target.value)} />
             </Field>
-            <Field label="Live symbol (optional)" hint="Blank = synthetic lab · e.g. AAPL tests on real bars">
-              <input className="pv-input" value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())} placeholder="Blank = synthetic" maxLength={12} style={{ fontFamily: 'var(--font-mono)' }} />
+            <Field label="Live symbol" hint="Real bars, keyless feed · blank = synthetic lab">
+              <input className="pv-input" value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())} placeholder="AAPL" maxLength={12} style={{ fontFamily: 'var(--font-mono)' }} />
             </Field>
           </div>
 
@@ -168,15 +168,43 @@ export default function PipelinePage() {
               </div>
 
               <div>
-                <div className="ui-eyebrow" style={{ marginBottom: '.45rem' }}>Backtest · costs {costs} + slippage {slip} bps</div>
+                <div className="ui-eyebrow" style={{ marginBottom: '.45rem' }}>
+                  {result.learning ? `Out-of-sample test · ${result.learning.dataset} · unseen ${result.learning.test_bars} bars` : `Backtest · costs ${costs} + slippage ${slip} bps`}
+                </div>
                 <KpiGrid>
-                  <Kpi label="Sharpe" value={fmt.num(m?.sharpe)} tone={m?.sharpe >= 1 ? 'tone-ok' : 'tone-warn'} />
+                  <Kpi label="Sharpe" value={fmt.num(m?.sharpe)} tone={m?.sharpe >= 1 ? 'tone-ok' : 'tone-warn'} foot={result.learning ? 'on unseen test bars' : undefined} />
                   <Kpi label="Return" value={fmt.pct(m?.returns)} tone="tone-ok" />
                   <Kpi label="Max DD" value={fmt.pct(m?.max_dd)} tone="tone-bad" />
                   <Kpi label="Win rate" value={fmt.pct(m?.win_rate, 1)} />
                   <Kpi label="Trades" value={fmt.int(m?.trades)} />
                 </KpiGrid>
               </div>
+
+              {result.learning && (
+                <div>
+                  <div className="ui-eyebrow" style={{ marginBottom: '.45rem' }}>
+                    Learning · {result.learning.candidates} candidates searched, {result.learning.viable} viable · {result.learning.source}
+                  </div>
+                  <KpiGrid>
+                    <Kpi label="Train Sharpe" value={fmt.num(result.learning.train?.sharpe)} foot={`${result.learning.train_bars} bars · selected here`} />
+                    <Kpi label="Test Sharpe" value={fmt.num(m?.sharpe)} foot={`${result.learning.test_bars} bars · never seen in training`} tone={m?.sharpe >= 1 ? 'tone-ok' : 'tone-warn'} />
+                  </KpiGrid>
+                </div>
+              )}
+
+              {result.learning?.walk_forward?.folds?.length ? (
+                <div>
+                  <div className="ui-eyebrow" style={{ marginBottom: '.45rem' }}>
+                    Walk-forward · re-selected per fold, tested on the next unseen block
+                  </div>
+                  <KpiGrid>
+                    <Kpi label="Mean test Sharpe" value={fmt.num(result.learning.walk_forward.mean_test_sharpe)} foot={`${result.learning.walk_forward.positive_folds}/${result.learning.walk_forward.n_folds} folds positive`} tone={result.learning.walk_forward.mean_test_sharpe >= 1 ? 'tone-ok' : 'tone-warn'} />
+                    {result.learning.walk_forward.folds.map((f) => (
+                      <Kpi key={f.fold} label={`Fold ${f.fold} test`} value={fmt.num(f.test_sharpe)} foot={`${f.winner} · ${f.test_bars} bars`} tone={f.test_sharpe > 0 ? 'tone-ok' : 'tone-bad'} />
+                    ))}
+                  </KpiGrid>
+                </div>
+              ) : null}
 
               <div style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}>
                 <Btn to="/strategies" variant="pv-btn-primary" icon="layers">Open in library</Btn>

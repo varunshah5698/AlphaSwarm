@@ -19,6 +19,7 @@ export default function DashboardPage() {
   const metrics = useStore((s) => s.metrics);
   const refresh = useStore((s) => s.refresh);
   const backendOk = useStore((s) => s.backendOk);
+  const settings = useStore((s) => s.settings);
 
   const [charts, setCharts] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -29,7 +30,7 @@ export default function DashboardPage() {
     setError(null);
     try {
       await refresh();
-      setCharts(await api.dashboardCharts());
+      setCharts(await api.dashboardCharts(settings?.benchmark || 'SPY'));
     } catch (e) {
       setError(e.message);
     }
@@ -80,7 +81,7 @@ export default function DashboardPage() {
       <div className="ui-grid split">
         <Card>
           <CardHead
-            title="Equity · best alpha vs benchmark"
+            title={`Equity · best alpha vs ${charts?.benchmark || 'benchmark'}`}
             sub={charts?.equity_source ? `Source: ${charts.equity_source}` : 'Waiting for a validated factor'}
             icon="chart"
             actions={<Pill tone="is-ok" dot>Live</Pill>}

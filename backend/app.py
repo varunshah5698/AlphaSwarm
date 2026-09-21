@@ -13,20 +13,25 @@ import os
 
 from db import conn, init_db, row_to_dict
 from auth import valid_email, valid_username, valid_password, hash_password, verify_password, new_token, avatar_for
-from quant import backtest, backtest_csv, backtest_live, writer_generate, judge_review, make_market, ENGINE_VERSION
+from quant import backtest, backtest_csv, backtest_live, backtest_yahoo, writer_generate, judge_review, make_market, learn, evaluate_oos, parse_csv_bars, _run_backtest, ENGINE_VERSION
 
 SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "7"))
 
 init_db()
 
-# Startup consistency: every stored strategy is a derivative of the synthetic
-# engine, so recompute all metrics under the current ENGINE_VERSION.
-# (Experiment rows keep their historical metrics JSON untouched.)
+# Startup consistency: synthetic-engine strategies are recomputed under the
+# current ENGINE_VERSION. Rows learned on real market data (dataset LIVE-*)
+# are NEVER touched here — recomputing them on synthetic data would corrupt
+# their curves and metrics. (Experiment rows keep historical JSON untouched.)
 try:
     _c = conn()
-    _rows = _c.execute("SELECT id, formula, judge_score FROM strategies").fetchall()
+    _cols = [r["name"] for r in _c.execute("PRAGMA table_info(strategies)").fetchall()]
+    _rows = _c.execute("SELECT id, formula, judge_score, dataset" if "dataset" in _cols else "SELECT id, formula, judge_score").fetchall()
     for _r in _rows:
         try:
+            _ds = _r["dataset"] if "dataset" in _cols else ""
+            if (_ds or "").startswith("LIVE-"):
+                continue
             _m = backtest(_r["formula"])
             _approved = (_r["judge_score"] or 0) >= 70
             _st = "active" if (_approved and _m["sharpe"] >= 1.0) else ("testing" if _m["sharpe"] >= 0.4 else "rejected")
@@ -36,6 +41,8 @@ try:
             )
         except Exception:
             pass
+    if "dataset" in _cols:
+        _c.execute("UPDATE strategies SET dataset='SYNTH-SPX-2014-2024' WHERE dataset IS NULL OR dataset=''")
     _c.commit()
     _c.close()
 except Exception:
@@ -132,12 +139,13 @@ class PipelineIn(BaseModel):
     hypothesis: str = Field(max_length=2000)
     costs_bps: int = Field(default=10, ge=0, le=500)
     slippage_bps: int = Field(default=5, ge=0, le=500)
-    symbol: str = Field(default="", max_length=12)  # optional: test on live Finnhub bars
+    symbol: str = Field(default="AAPL", max_length=12)  # single-stock focus; "" = synthetic lab data
 
 class BacktestIn(BaseModel):
     formula: str = Field(max_length=500)
     costs_bps: int = Field(default=10, ge=0, le=500)
     slippage_bps: int = Field(default=5, ge=0, le=500)
+    symbol: str = Field(default="", max_length=12)  # optional: real bars + train/test report
 
 class LiveBacktestIn(BacktestIn):
     symbol: str = Field(max_length=12)
@@ -374,9 +382,21 @@ def _best_strategy(strats: list[dict]) -> dict | None:
     return max(pool, key=lambda s: s["sharpe"]) if pool else None
 
 
+def _resample(vals: list[float], n: int) -> list[float]:
+    """Resample a series to exactly n points by even index mapping."""
+    if n <= 0:
+        return []
+    if len(vals) == n:
+        return vals
+    if len(vals) < n:
+        return vals + [vals[-1]] * (n - len(vals)) if vals else []
+    idx = [round(i * (len(vals) - 1) / (n - 1)) for i in range(n)]
+    return [vals[i] for i in idx]
+
+
 @app.get("/api/dashboard/charts")
-def dashboard_charts(authorization: str | None = Header(default=None)):
-    """Live dashboard series — all derived from stored strategies, logs and market."""
+def dashboard_charts(benchmark: str = "SPY", authorization: str | None = Header(default=None)):
+    """Live dashboard series — best alpha vs a real benchmark overlay."""
     _require_user(authorization)
     c = conn()
     strats = [dict(r) for r in c.execute("SELECT * FROM strategies").fetchall()]
@@ -392,8 +412,18 @@ def dashboard_charts(authorization: str | None = Header(default=None)):
 
     best = _best_strategy(strats)
     alpha_vals = _equity_vals(best) if best else []
-    df = make_market()
-    bench = (1 + df["close"].pct_change().fillna(0)).cumprod().iloc[::10].tolist()
+    # Display-only downsampling: storage is full-resolution, the chart needs ≤252 pts.
+    _step = max(1, len(alpha_vals) // 252)
+    alpha_vals = alpha_vals[::_step]
+    bench_sym = (benchmark or "SPY").strip().upper()[:12] or "SPY"
+    try:
+        _, _bdf, _bsrc = _get_live_bars(bench_sym, years=10)
+        _bvals = (1 + _bdf["close"].pct_change().fillna(0)).cumprod().tolist()
+    except Exception:
+        _df = make_market()
+        _bvals = (1 + _df["close"].pct_change().fillna(0)).cumprod().tolist()
+        bench_sym = "SYNTH-SPX"
+    bench = _resample(_bvals, len(alpha_vals)) if alpha_vals else _bvals[:: max(1, len(_bvals) // 252)]
     n = max(len(alpha_vals), len(bench))
     equity = [
         {
@@ -409,32 +439,80 @@ def dashboard_charts(authorization: str | None = Header(default=None)):
     return {
         "equity": equity,
         "equity_source": best["name"] if best else None,
+        "benchmark": bench_sym,
         "distribution": distribution,
         "activity": activity,
     }
 
 
-PERIOD_POINTS = {"1M": 30, "3M": 63, "6M": 126, "1Y": 252, "ALL": 252}
+# Trading-day window sizes. Curves are stored at full bar resolution, so these
+# are real horizons (21 trading days ≈ 1 calendar month). ALL = whole history.
+PERIOD_POINTS = {"1M": 21, "3M": 63, "6M": 126, "1Y": 252, "ALL": None}
 
 
 def _slice_window(vals: list[float], period: str) -> list[float]:
-    want = PERIOD_POINTS.get(period, 252)
-    return vals[-want:] if len(vals) > want else vals
+    want = PERIOD_POINTS.get(period)
+    if not want or len(vals) <= want:
+        return vals
+    return vals[-want:]
 
 
-def _chunk_returns(vals: list[float], chunks: int = 12) -> list[float]:
+def _window_metrics(vals: list[float]) -> dict:
+    """Return / Sharpe / drawdown / win-rate computed on one equity slice.
+
+    Sharpe is annualized with sqrt(252) on daily bar returns; win rate is the
+    share of up-days among days the equity moved.
+    """
+    import math
+    if len(vals) < 2 or not vals[0]:
+        return {"returns": 0.0, "sharpe": 0.0, "max_dd": 0.0, "win_rate": 0.0}
+    rets = [(vals[i] / vals[i - 1] - 1) for i in range(1, len(vals)) if vals[i - 1]]
+    total = (vals[-1] / vals[0] - 1) * 100
+    peak, dd = vals[0], 0.0
+    for v in vals:
+        peak = max(peak, v)
+        if peak:
+            dd = min(dd, (v / peak - 1) * 100)
+    if rets:
+        mu = sum(rets) / len(rets)
+        var = sum((x - mu) ** 2 for x in rets) / len(rets)
+        sd = math.sqrt(var) if var > 0 else 1e-9
+        sharpe = mu / sd * math.sqrt(252)
+    else:
+        sharpe = 0.0
+    moved = [r for r in rets if r != 0]
+    win = sum(1 for r in moved if r > 0) / len(moved) * 100 if moved else 0.0
+    return {"returns": round(total, 2), "sharpe": round(sharpe, 2),
+            "max_dd": round(dd, 2), "win_rate": round(win, 1)}
+
+
+def _chunk_returns(vals: list[float]) -> list[tuple]:
+    """Split a window into honest calendar-ish buckets with labels.
+
+    Windows up to ~18 months split into ~21-trading-day months (M1..Mn);
+    longer windows split into ~252-day years (Y1..Yn) so a label always means
+    what it says.
+    """
     if len(vals) < 2:
         return []
-    size = max(1, len(vals) // chunks)
+    if len(vals) <= 378:
+        per, prefix = 21, "M"
+    else:
+        per, prefix = 252, "Y"
+    n = max(1, min(12, round(len(vals) / per)))
+    size = max(1, len(vals) // n)
     out = []
     for i in range(0, len(vals) - 1, size):
         seg = vals[i : i + size + 1]
         if len(seg) > 1 and seg[0]:
-            out.append(round((seg[-1] / seg[0] - 1) * 100, 2))
-    return out[-chunks:]
+            out.append((f"{prefix}{len(out) + 1}", round((seg[-1] / seg[0] - 1) * 100, 2)))
+        if len(out) >= 12:
+            break
+    return out
 
 
-def _rolling_sharpe(vals: list[float], window: int = 30) -> list[float]:
+def _rolling_sharpe(vals: list[float], window: int = 20) -> list[float]:
+    window = max(5, min(window, len(vals) // 3))
     if len(vals) < window + 1:
         return []
     import math
@@ -445,7 +523,7 @@ def _rolling_sharpe(vals: list[float], window: int = 30) -> list[float]:
         mu = sum(w) / len(w)
         var = sum((x - mu) ** 2 for x in w) / len(w)
         sd = math.sqrt(var) if var > 0 else 1e-9
-        out.append(round(mu / sd * math.sqrt(252 / 10), 2))
+        out.append(round(mu / sd * math.sqrt(252), 2))
     return out
 
 
@@ -460,11 +538,14 @@ def analytics(period: str = "1Y", authorization: str | None = Header(default=Non
         return {"kpis": None, "monthly": [], "scatter": [], "rolling": [], "radar": []}
 
     actives = [s for s in strats if s["status"] == "active"] or strats
-    avg = lambda k: sum(s[k] for s in actives) / len(actives)
+    # Every KPI is recomputed on the selected window, per strategy, then averaged —
+    # switching 1M/3M/6M/1Y/ALL genuinely changes these numbers.
+    per_strat = [_window_metrics(_slice_window(_equity_vals(s), period)) for s in actives]
+    avg = lambda k: sum(m[k] for m in per_strat) / len(per_strat)
     kpis = {
         "total_return": round(avg("returns"), 2),
         "sharpe": round(avg("sharpe"), 2),
-        "max_dd": round(min(s["max_dd"] for s in actives), 2),
+        "max_dd": round(min(m["max_dd"] for m in per_strat), 2),
         "win_rate": round(avg("win_rate"), 1),
         "active_count": len([s for s in strats if s["status"] == "active"]),
         "total_count": len(strats),
@@ -472,17 +553,16 @@ def analytics(period: str = "1Y", authorization: str | None = Header(default=Non
 
     best = _best_strategy(strats)
     window = _slice_window(_equity_vals(best) if best else [], period)
-    monthly_vals = _chunk_returns(window)
     monthly = [
-        {"month": f"M{i + 1}", "returns": v} for i, v in enumerate(monthly_vals)
+        {"month": label, "returns": v} for label, v in _chunk_returns(window)
     ]
     rolling = [
         {"day": i + 1, "sharpe": v} for i, v in enumerate(_rolling_sharpe(window))
     ]
-    scatter = [
-        {"x": round(abs(s["max_dd"]), 2), "y": s["returns"], "name": s["name"][:24]}
-        for s in strats
-    ]
+    scatter = []
+    for s in strats:
+        m = _window_metrics(_slice_window(_equity_vals(s), period))
+        scatter.append({"x": round(abs(m["max_dd"]), 2), "y": m["returns"], "name": s["name"][:24]})
 
     def clamp(v, lo=0, hi=100):
         return max(lo, min(hi, round(v)))
@@ -510,8 +590,9 @@ def list_strats(status: str = "all", q: str = "", authorization: str | None = He
         d = row_to_dict(r)
         if status != "all" and d["status"] != status: continue
         if q and q.lower() not in (d["name"] + d["formula"]).lower(): continue
-        # don't ship full equity in list
+        # don't ship curves in list (full-res is ~2500 pts each — detail endpoint has them)
         d.pop("equity", None)
+        d.pop("equity_curve", None)
         out.append(d)
     return out
 
@@ -527,8 +608,8 @@ def create_strat(s: StrategyIn, authorization: str | None = Header(default=None)
         raise HTTPException(400, str(e))
     c = conn()
     cur = c.execute(
-        "INSERT INTO strategies (name, hypothesis, formula, status, sharpe, returns, max_dd, win_rate, trades, author, ann_vol, equity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (s.name, s.hypothesis, s.formula, s.status, m["sharpe"], m["returns"], m["max_dd"], m["win_rate"], m["trades"], u["username"], m.get("ann_vol", 0), json.dumps(m["equity_curve"])))
+        "INSERT INTO strategies (name, hypothesis, formula, status, sharpe, returns, max_dd, win_rate, trades, author, ann_vol, equity, dataset) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (s.name, s.hypothesis, s.formula, s.status, m["sharpe"], m["returns"], m["max_dd"], m["win_rate"], m["trades"], u["username"], m.get("ann_vol", 0), json.dumps(m["equity_curve"]), "SYNTH-SPX-2014-2024"))
     c.commit(); sid = cur.lastrowid; c.close()
     log("Writer Agent", f"Manual strategy created by {u['username']}: {s.name}")
     return {"id": sid, **m}
@@ -567,32 +648,82 @@ def del_strat(sid: int, authorization: str | None = Header(default=None)):
 
 
 # ---------- pipeline: Generate -> Critique -> Test -> Measure -> Learn ----------
+def _get_live_bars(symbol: str, years: float = 10):
+    """Real daily bars for one symbol. Yahoo Finance (keyless) first, Finnhub
+    fallback when FINNHUB_API_KEY is configured. Returns (symbol, df, source)."""
+    from yahoo_provider import clean_symbol as _yclean, fetch_bars as _ybars
+    s = _yclean(symbol)
+    try:
+        return s, _ybars(s, years=years), "Yahoo Finance"
+    except Exception as ye:
+        try:
+            from finnhub_provider import fetch_bars as _fbars, is_configured, clean_symbol as _fclean
+            if is_configured():
+                return s, _fbars(_fclean(symbol), years=min(years, 10)), "Finnhub"
+        except Exception:
+            pass
+        if isinstance(ye, ValueError):
+            raise HTTPException(400, str(ye))
+        raise HTTPException(503, f"{ye} (Set FINNHUB_API_KEY on the server as a fallback feed.)")
+
+
 @app.post("/api/pipeline/run")
 def pipeline_run(p: PipelineIn, authorization: str | None = Header(default=None)):
     u = _require_user(authorization)
     _check_rate(f"pipeline:{u['id']}", 8, 60)
     if not p.hypothesis.strip():
         raise HTTPException(400, "Hypothesis is required.")
-    dataset = "SYNTH-SPX-2014-2024"
     symbol = (p.symbol or "").strip().upper()
-    if symbol:
-        try:
-            from finnhub_provider import clean_symbol
-            clean_symbol(symbol)
-            dataset = f"LIVE-{symbol}"
-        except Exception as e:
-            raise HTTPException(400, str(e))
     log("Research Agent", f"Hypothesis received: {p.hypothesis[:120]}")
+    if symbol:
+        # Learn on real market data: search the candidate space on a training
+        # segment, select there, report on unseen test bars. Headline = test.
+        try:
+            sym, df, source = _get_live_bars(symbol)
+        except HTTPException as e:
+            log("Data Ingestion", f"Live bars failed for {symbol}: {e.detail}", "error")
+            raise
+        dataset = f"LIVE-{sym}"
+        log("Data Ingestion", f"Loaded {source} {sym}: {len(df)} daily bars")
+        try:
+            res = learn(df, p.hypothesis, p.costs_bps, p.slippage_bps)
+        except Exception as e:
+            log("Backtest Engine", f"Learning failed: {e}", "error")
+            raise HTTPException(400, f"Learning failed: {e}")
+        w = {"name": res["name"], "formula": res["formula"], "code": res["code"]}
+        log("Writer Agent", f"Learned {res['candidates']} candidates, {res['viable']} viable — winner: {res['formula']}")
+        j = judge_review(res["formula"], p.hypothesis)
+        lvl = "success" if j["verdict"] == "approve" else ("warn" if j["verdict"] == "revise" else "error")
+        log("Judge Agent", f"Verdict={j['verdict']} score={j['score']}: {j['notes']}", lvl)
+        t, m = res["train"], res["test"]
+        status = "active" if (j["verdict"] == "approve" and m["sharpe"] >= 1.0) else ("testing" if m["sharpe"] >= 0.4 else "rejected")
+        wf = res.get("walk_forward", {})
+        log("Backtest Engine", f"Learned [{dataset}]: train Sharpe={t['sharpe']} → TEST Sharpe={m['sharpe']} Return={m['returns']}% DD={m['max_dd']}% | walk-forward {wf.get('mean_test_sharpe')} ({wf.get('positive_folds')}/{wf.get('n_folds')} folds+)", "success")
+        metrics = {**m, "equity_curve": res["full"]["equity_curve"], "dataset": dataset}
+        learning = {"source": source, "symbol": sym, "dataset": dataset,
+                    "candidates": res["candidates"], "viable": res["viable"],
+                    "train": t, "test_bars": res["test_bars"], "train_bars": res["train_bars"],
+                    "walk_forward": wf,
+                    "selection_score": res["selection_score"]}
+        c = conn()
+        cur = c.execute(
+            "INSERT INTO strategies (name, hypothesis, formula, code, status, sharpe, returns, max_dd, win_rate, trades, author, judge_notes, judge_score, ann_vol, equity, dataset) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (w["name"], p.hypothesis, w["formula"], w["code"], status, m["sharpe"], m["returns"], m["max_dd"], m["win_rate"], m["trades"], "Writer Agent", j["notes"], j["score"], m.get("ann_vol", 0), json.dumps(metrics["equity_curve"]), dataset))
+        sid = cur.lastrowid
+        c.execute("INSERT INTO experiments (strategy_id, hypothesis, writer_output, judge_output, metrics, costs_bps, slippage_bps, dataset) VALUES (?,?,?,?,?,?,?,?)",
+                  (sid, p.hypothesis, json.dumps(w), json.dumps(j), json.dumps({**metrics, "equity_curve": metrics["equity_curve"][:252]}), p.costs_bps, p.slippage_bps, dataset))
+        c.execute("INSERT INTO logs (level, agent, message) VALUES (?,?,?)",
+                  ("success" if status == "active" else "info", "Feedback Agent", f"Strategy #{sid} learned on {sym} test data, stored as {status}"))
+        c.commit(); c.close()
+        return {"strategy_id": sid, "writer": w, "judge": j, "metrics": metrics, "status": status, "learning": learning}
+    dataset = "SYNTH-SPX-2014-2024"
     w = writer_generate(p.hypothesis)
     log("Writer Agent", f"Formula generated: {w['formula']}")
     j = judge_review(w["formula"], p.hypothesis)
     lvl = "success" if j["verdict"] == "approve" else ("warn" if j["verdict"] == "revise" else "error")
     log("Judge Agent", f"Verdict={j['verdict']} score={j['score']}: {j['notes']}", lvl)
     try:
-        if symbol:
-            m = backtest_live(symbol, w["formula"], p.costs_bps, p.slippage_bps)
-        else:
-            m = backtest(w["formula"], p.costs_bps, p.slippage_bps)
+        m = backtest(w["formula"], p.costs_bps, p.slippage_bps)
     except Exception as e:
         log("Backtest Engine", f"Backtest failed: {e}", "error")
         raise HTTPException(400, f"Backtest failed: {e}")
@@ -602,8 +733,8 @@ def pipeline_run(p: PipelineIn, authorization: str | None = Header(default=None)
     log("Backtest Engine", f"Backtest complete [{dataset}]: Sharpe={m['sharpe']} Return={m['returns']}% DD={m['max_dd']}%", "success")
     c = conn()
     cur = c.execute(
-        "INSERT INTO strategies (name, hypothesis, formula, code, status, sharpe, returns, max_dd, win_rate, trades, author, judge_notes, judge_score, ann_vol, equity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (w["name"], p.hypothesis, w["formula"], w["code"], status, m["sharpe"], m["returns"], m["max_dd"], m["win_rate"], m["trades"], "Writer Agent", j["notes"], j["score"], m.get("ann_vol", 0), json.dumps(m["equity_curve"])))
+        "INSERT INTO strategies (name, hypothesis, formula, code, status, sharpe, returns, max_dd, win_rate, trades, author, judge_notes, judge_score, ann_vol, equity, dataset) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (w["name"], p.hypothesis, w["formula"], w["code"], status, m["sharpe"], m["returns"], m["max_dd"], m["win_rate"], m["trades"], "Writer Agent", j["notes"], j["score"], m.get("ann_vol", 0), json.dumps(m["equity_curve"]), dataset))
     sid = cur.lastrowid
     c.execute("INSERT INTO experiments (strategy_id, hypothesis, writer_output, judge_output, metrics, costs_bps, slippage_bps, dataset) VALUES (?,?,?,?,?,?,?,?)",
               (sid, p.hypothesis, json.dumps(w), json.dumps(j), json.dumps(m), p.costs_bps, p.slippage_bps, dataset))
@@ -616,8 +747,30 @@ def pipeline_run(p: PipelineIn, authorization: str | None = Header(default=None)
 def run_backtest(b: BacktestIn, authorization: str | None = Header(default=None)):
     u = _require_user(authorization)
     _check_rate(f"backtest:{u['id']}", 20, 60)
+    symbol = (b.symbol or "").strip().upper()
     try:
-        return backtest(b.formula, b.costs_bps, b.slippage_bps)
+        if symbol:
+            sym, df, source = _get_live_bars(symbol)
+            out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps)
+            oos = evaluate_oos(df, b.formula, b.costs_bps, b.slippage_bps)
+            out["dataset"] = f"YAHOO-{sym}" if source.startswith("Yahoo") else f"LIVE-{sym}"
+            out["symbol"] = sym
+            out["train"] = oos["train"]
+            out["test"] = oos["test"]
+            out["train_bars"] = oos["train_bars"]
+            out["test_bars"] = oos["test_bars"]
+            log("Backtest Engine", f"Backtest by {u['username']}: {sym} train Sharpe={oos['train']['sharpe']} test Sharpe={oos['test']['sharpe']}")
+            return out
+        df = make_market()
+        out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps)
+        oos = evaluate_oos(df, b.formula, b.costs_bps, b.slippage_bps)
+        out["train"] = oos["train"]
+        out["test"] = oos["test"]
+        out["train_bars"] = oos["train_bars"]
+        out["test_bars"] = oos["test_bars"]
+        return out
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, str(e))
 
@@ -639,18 +792,29 @@ async def run_backtest_csv(
     try:
         raw = await file.read()
         out = backtest_csv(raw, formula, costs_bps, slippage_bps)
+        df = parse_csv_bars(raw)
+        oos = evaluate_oos(df, formula, costs_bps, slippage_bps)
+        out["train"] = oos["train"]
+        out["test"] = oos["test"]
+        out["train_bars"] = oos["train_bars"]
+        out["test_bars"] = oos["test_bars"]
     except Exception as e:
         raise HTTPException(400, str(e))
-    log("Backtest Engine", f"CSV backtest by {u['username']}: {file.filename} Sharpe={out['sharpe']}")
+    log("Backtest Engine", f"CSV backtest by {u['username']}: {file.filename} Sharpe={out['sharpe']} test Sharpe={out['test']['sharpe']}")
     return out
 
 @app.post("/api/backtest/live")
 def run_backtest_live(b: LiveBacktestIn, authorization: str | None = Header(default=None)):
-    """Backtest a formula on real Finnhub daily bars for a symbol."""
+    """Backtest a formula on real daily bars for a symbol (Yahoo keyless, Finnhub fallback)."""
     u = _require_user(authorization)
     _check_rate(f"backtest:{u['id']}", 20, 60)
     try:
-        out = backtest_live(b.symbol, b.formula, b.costs_bps, b.slippage_bps, years=b.years)
+        sym, df, source = _get_live_bars(b.symbol, years=b.years)
+        out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps)
+        out["dataset"] = f"LIVE-{sym}"
+        out["symbol"] = sym
+    except HTTPException:
+        raise
     except (ValueError, ConnectionError) as e:
         raise HTTPException(400 if isinstance(e, ValueError) else 503, str(e))
     log("Backtest Engine", f"Live backtest by {u['username']}: {out['symbol']} Sharpe={out['sharpe']}")
@@ -662,12 +826,11 @@ def test_all_strategies(b: TestAllIn, authorization: str | None = Header(default
     u = _require_user(authorization)
     _check_rate(f"testall:{u['id']}", 4, 60)
     try:
-        from finnhub_provider import fetch_bars, clean_symbol
-        symbol = clean_symbol(b.symbol)
-        df = fetch_bars(symbol)
+        symbol, df, source = _get_live_bars(b.symbol)
+    except HTTPException as e:
+        raise
     except (ValueError, ConnectionError) as e:
         raise HTTPException(400 if isinstance(e, ValueError) else 503, str(e))
-    from quant import _run_backtest
     c = conn()
     strats = [dict(r) for r in c.execute("SELECT id, name, formula FROM strategies ORDER BY id").fetchall()]
     c.close()
@@ -684,8 +847,8 @@ def test_all_strategies(b: TestAllIn, authorization: str | None = Header(default
         except Exception as e:
             results.append({"id": s["id"], "name": s["name"], "formula": s["formula"], "error": str(e)[:120]})
     results.sort(key=lambda r: r.get("sharpe", -99), reverse=True)
-    log("Backtest Engine", f"Test-all by {u['username']}: {symbol} ({len(results)} strategies)")
-    return {"symbol": symbol, "bars": len(df), "results": results}
+    log("Backtest Engine", f"Test-all by {u['username']}: {symbol} via {source} ({len(results)} strategies)")
+    return {"symbol": symbol, "bars": len(df), "source": source, "results": results}
 
 # ---------- live market (Finnhub, key stays server-side) ----------
 @app.get("/api/market/live")
@@ -710,15 +873,14 @@ def market_live(symbols: str = "SPY,AAPL,MSFT,TSLA,NVDA", authorization: str | N
 def market_candles(symbol: str = "SPY", years: float = 2, authorization: str | None = Header(default=None)):
     u = _require_user(authorization)
     _check_rate(f"market:{u['id']}", 30, 60)
-    from finnhub_provider import fetch_bars, is_configured
-    if not is_configured():
-        raise HTTPException(503, "Live feed not configured. Set FINNHUB_API_KEY on the server.")
     try:
-        df = fetch_bars(symbol, years=max(0.25, min(years, 10)))
+        sym, df, source = _get_live_bars(symbol, years=max(0.25, min(years, 10)))
+    except HTTPException:
+        raise
     except (ValueError, ConnectionError) as e:
         raise HTTPException(400 if isinstance(e, ValueError) else 503, str(e))
     step = max(1, len(df) // 252)
-    return {"symbol": symbol.strip().upper(), "bars": len(df),
+    return {"symbol": sym, "bars": len(df), "source": source,
             "closes": [{"t": int(i), "v": round(float(v), 2)} for i, v in enumerate(df["close"].iloc[::step])]}
 
 @app.get("/api/experiments")

@@ -5,7 +5,7 @@ import { Card, CardHead, Btn, Field, StatusPill, TableWrap } from './ui';
 import { LoadingSkeleton } from './PageState';
 import { fmt } from '../lib/chartTheme';
 
-// Runs EVERY stored strategy on live Finnhub bars for one symbol, ranked best-first.
+// Runs EVERY stored strategy on real bars for one symbol, ranked best-first.
 export default function TestAllPanel() {
   const [symbol, setSymbol] = useState('SPY');
   const [running, setRunning] = useState(false);

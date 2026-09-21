@@ -195,7 +195,6 @@ export default function LandingPage() {
               src={VIDEO_URL}
               autoPlay muted loop playsInline
               preload="metadata"
-              controls
               style={{ width: '100%', borderRadius: 10, border: '1.5px solid var(--pv-ink)', display: 'block', background: '#000' }}
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '.6rem', fontSize: '.75rem', color: 'var(--text-muted)' }}>

@@ -86,6 +86,6 @@ export const api = {
   marketCandles: (symbol = "SPY", years = 2) => req(`/api/market/candles?symbol=${encodeURIComponent(symbol)}&years=${years}`),
   backtestLive: (body) => req("/api/backtest/live", { method: "POST", body: JSON.stringify(body) }),
   testAll: (body) => req("/api/strategies/test-all", { method: "POST", body: JSON.stringify(body) }),
-  dashboardCharts: () => req("/api/dashboard/charts"),
+  dashboardCharts: (benchmark = "SPY") => req(`/api/dashboard/charts?benchmark=${encodeURIComponent(benchmark)}`),
   analytics: (period = "1Y") => req(`/api/analytics?period=${period}`),
 };

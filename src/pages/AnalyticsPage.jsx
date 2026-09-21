@@ -55,15 +55,15 @@ export default function AnalyticsPage() {
         <>
           <KpiGrid>
             <Kpi label="Avg return" value={fmt.pct(k.total_return)} foot={`window ${period}`} icon="activity" tone="tone-ok" />
-            <Kpi label="Avg Sharpe" value={fmt.num(k.sharpe)} foot="risk-adjusted" icon="target" tone={k.sharpe >= 1 ? 'tone-ok' : 'tone-warn'} />
-            <Kpi label="Worst drawdown" value={fmt.pct(k.max_dd)} foot="peak to trough" icon="arrowDown" tone="tone-bad" />
-            <Kpi label="Avg win rate" value={fmt.pct(k.win_rate, 1)} foot="cost-adjusted" icon="check" />
+            <Kpi label="Avg Sharpe" value={fmt.num(k.sharpe)} foot={`window ${period} · risk-adjusted`} icon="target" tone={k.sharpe >= 1 ? 'tone-ok' : 'tone-warn'} />
+            <Kpi label="Worst drawdown" value={fmt.pct(k.max_dd)} foot={`window ${period} · peak to trough`} icon="arrowDown" tone="tone-bad" />
+            <Kpi label="Avg win rate" value={fmt.pct(k.win_rate, 1)} foot={`window ${period} · cost-adjusted`} icon="check" />
             <Kpi label="Active factors" value={`${k.active_count}/${k.total_count}`} foot="passing all checks" icon="layers" variant="accent" />
           </KpiGrid>
 
           <div className="ui-grid halves">
             <Card>
-              <CardHead title={`Period returns · ${period}`} sub="Best factor, sliced into equal windows" icon="chart" actions={<Pill tone="is-quiet">{monthly.length} slices</Pill>} />
+              <CardHead title={`Period returns · ${period}`} sub="Best factor, one bar per month (per year on ALL)" icon="chart" actions={<Pill tone="is-quiet">{monthly.length} slices</Pill>} />
               {loading ? <LoadingSkeleton rows={1} height={250} /> : monthly.length ? (
                 <ResponsiveContainer width="100%" height={252}>
                   <BarChart data={monthly} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
@@ -78,7 +78,7 @@ export default function AnalyticsPage() {
             </Card>
 
             <Card>
-              <CardHead title="Risk vs return" sub="x = drawdown magnitude % · y = total return %" icon="target" actions={<Pill tone="is-quiet">{scatter.length} factors</Pill>} />
+              <CardHead title={`Risk vs return · ${period}`} sub="x = drawdown magnitude % · y = total return % in this window" icon="target" actions={<Pill tone="is-quiet">{scatter.length} factors</Pill>} />
               {loading ? <LoadingSkeleton rows={1} height={250} /> : scatter.length ? (
                 <ResponsiveContainer width="100%" height={252}>
                   <ScatterChart margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
