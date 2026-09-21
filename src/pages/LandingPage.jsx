@@ -4,6 +4,8 @@ import { Logo, Icon, IconBadge } from '../components/Brand';
 import { CodeTyper } from '../components/CodeTyper';
 import { api } from '../lib/api';
 
+const VIDEO_URL = 'https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260319_192508_4eecde4c-f835-4f4b-b255-eafd1156da99.mp4';
+
 const STEPS = [
   ['Research', 'Hypothesis + dataset ingestion', 'book'],
   ['Writer', 'Hypothesis → factor, rule, code', 'terminal'],
@@ -156,6 +158,34 @@ export default function LandingPage() {
                   </div>
                 );
               })}
+            </div>
+          </div>
+        </div>
+
+        {/* ---------- 3D showcase ---------- */}
+        <div className="landing-split" style={{ display: 'grid', gridTemplateColumns: '1fr 1.2fr', gap: '1rem', marginTop: '2.5rem', alignItems: 'center' }}>
+          <div>
+            <span className="pv-badge" style={{ background: 'var(--pv-lime)' }}>3D · WATCH THE SWARM</span>
+            <h2 style={{ fontSize: 'clamp(1.6rem, 3vw, 2.2rem)', margin: '.8rem 0 .6rem', letterSpacing: '-.02em' }}>Six agents. One loop.<br />Zero spreadsheets.</h2>
+            <p style={{ color: 'var(--text-secondary)', lineHeight: 1.65, maxWidth: 440 }}>
+              Research flows into the Writer, the Judge inspects every factor, the backtester
+              prices it with costs — and memory carries the lesson into the next cycle.
+            </p>
+            <div style={{ display: 'flex', gap: '.6rem', marginTop: '1.1rem', flexWrap: 'wrap' }}>
+              <Link to="/pipeline" className="pv-btn pv-btn-primary">Try the loop →</Link>
+            </div>
+          </div>
+          <div className="pv-card" style={{ padding: '.8rem' }}>
+            <video
+              src={VIDEO_URL}
+              autoPlay muted loop playsInline
+              preload="metadata"
+              controls
+              style={{ width: '100%', borderRadius: 10, border: '1.5px solid var(--pv-ink)', display: 'block', background: '#000' }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '.6rem', fontSize: '.75rem', color: 'var(--text-muted)' }}>
+              <span>Alpha Swarm · agentic mining loop</span>
+              <span className="pv-badge" style={{ background: '#fff' }}>10s · HD</span>
             </div>
           </div>
         </div>
