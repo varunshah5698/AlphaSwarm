@@ -65,6 +65,30 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at TEXT DEFAULT (datetime('now', '+7 days')),
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS paper_account (
+  symbol TEXT PRIMARY KEY,
+  strategy_id INTEGER,
+  capital REAL DEFAULT 1.0,
+  position REAL DEFAULT 0.0,
+  last_date TEXT DEFAULT '',
+  costs_bps INTEGER DEFAULT 10,
+  slippage_bps INTEGER DEFAULT 5,
+  max_pos REAL DEFAULT 1.0,
+  stop_pct REAL DEFAULT 10.0,
+  regime_off INTEGER DEFAULT 1,
+  started_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS paper_daily (
+  symbol TEXT DEFAULT '',
+  date TEXT DEFAULT '',
+  equity REAL DEFAULT 1.0,
+  benchmark REAL DEFAULT 1.0,
+  position REAL DEFAULT 0.0,
+  price REAL DEFAULT 0.0,
+  ret REAL DEFAULT 0.0,
+  PRIMARY KEY (symbol, date)
+);
 """
 
 SEED_STRATEGIES = [
@@ -96,7 +120,36 @@ def conn():
 def init_db():
     c = conn()
     c.executescript(SCHEMA)
-    # lightweight migration for DBs created before ann_vol existed
+    # migrate first-generation single-ledger paper_account (id=1) to symbol-keyed rows
+    try:
+        _sql = (c.execute("SELECT sql FROM sqlite_master WHERE name='paper_account'").fetchone() or [None])[0] or ""
+        if "CHECK (id = 1)" in _sql or "CHECK(id=1)" in _sql.replace(" ", ""):
+            _old = [dict(r) for r in c.execute("SELECT * FROM paper_account").fetchall()]
+            c.execute("DROP TABLE paper_account")
+            c.executescript(SCHEMA)
+            for r in _old:
+                c.execute(
+                    "INSERT INTO paper_account (symbol, strategy_id, capital, position, last_date, costs_bps, slippage_bps) VALUES (?,?,?,?,?,?,?)",
+                    (r.get("symbol") or "AAPL", r.get("strategy_id"), r.get("capital", 1.0),
+                     r.get("position", 0.0), r.get("last_date", ""), r.get("costs_bps", 10), r.get("slippage_bps", 5)))
+            c.commit()
+    except Exception:
+        pass
+    # migrate first-generation paper_daily (PK on date only) to (symbol, date)
+    try:
+        _dsql = (c.execute("SELECT sql FROM sqlite_master WHERE name='paper_daily'").fetchone() or [None])[0] or ""
+        if "PRIMARY KEY (symbol, date)" not in _dsql:
+            _dold = [dict(r) for r in c.execute("SELECT * FROM paper_daily").fetchall()]
+            c.execute("DROP TABLE paper_daily")
+            c.executescript(SCHEMA)
+            for r in _dold:
+                c.execute(
+                    "INSERT OR REPLACE INTO paper_daily (symbol, date, equity, benchmark, position, price, ret) VALUES (?,?,?,?,?,?,?)",
+                    (r.get("symbol") or "AAPL", r.get("date"), r.get("equity", 1.0),
+                     r.get("benchmark", 1.0), r.get("position", 0.0), r.get("price", 0.0), r.get("ret", 0.0)))
+            c.commit()
+    except Exception:
+        pass    # lightweight migration for DBs created before ann_vol existed
     cols = [r["name"] for r in c.execute("PRAGMA table_info(strategies)").fetchall()]
     if "ann_vol" not in cols:
         c.execute("ALTER TABLE strategies ADD COLUMN ann_vol REAL DEFAULT 0")

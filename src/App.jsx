@@ -19,6 +19,7 @@ const AnalyticsPage = lazy(() => import('./pages/AnalyticsPage'));
 const AgentsPage = lazy(() => import('./pages/AgentsPage'));
 const PipelinePage = lazy(() => import('./pages/PipelinePage'));
 const BacktestPage = lazy(() => import('./pages/BacktestPage'));
+const PaperPage = lazy(() => import('./pages/PaperPage'));
 const ResearchPage = lazy(() => import('./pages/ResearchPage'));
 const ReportsPage = lazy(() => import('./pages/ReportsPage'));
 const LogsPage = lazy(() => import('./pages/LogsPage'));
@@ -129,6 +130,7 @@ export default function App() {
                     <Route path="/agents" element={<AgentsPage />} />
                     <Route path="/pipeline" element={<PipelinePage />} />
                     <Route path="/backtest" element={<BacktestPage />} />
+                    <Route path="/paper" element={<PaperPage />} />
                     <Route path="/research" element={<ResearchPage />} />
                     <Route path="/reports" element={<ReportsPage />} />
                     <Route path="/logs" element={<LogsPage />} />

@@ -87,5 +87,8 @@ export const api = {
   backtestLive: (body) => req("/api/backtest/live", { method: "POST", body: JSON.stringify(body) }),
   testAll: (body) => req("/api/strategies/test-all", { method: "POST", body: JSON.stringify(body) }),
   dashboardCharts: (benchmark = "SPY") => req(`/api/dashboard/charts?benchmark=${encodeURIComponent(benchmark)}`),
+  paper: (symbol = "AAPL") => req(`/api/paper?symbol=${encodeURIComponent(symbol)}`),
+  paperRun: (symbol = "AAPL") => req(`/api/paper/run?symbol=${encodeURIComponent(symbol)}`, { method: "POST" }),
+  paperRetrain: (symbol = "AAPL") => req(`/api/paper/retrain?symbol=${encodeURIComponent(symbol)}`, { method: "POST" }),
   analytics: (period = "1Y") => req(`/api/analytics?period=${period}`),
 };

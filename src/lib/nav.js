@@ -10,6 +10,7 @@ export const NAV = [
       { to: '/pipeline', label: 'Pipeline', icon: 'flow', desc: 'Generate → critique → test → learn' },
       { to: '/strategies', label: 'Strategies', icon: 'layers', desc: 'Factor library, verdicts and status' },
       { to: '/backtest', label: 'Backtesting', icon: 'activity', desc: 'Formula engine + your own CSV' },
+      { to: '/paper', label: 'Paper trading', icon: 'chart', desc: 'Forward track record vs buy-and-hold' },
       { to: '/analytics', label: 'Analytics', icon: 'gauge', desc: 'Risk, rolling Sharpe and radar' },
     ],
   },

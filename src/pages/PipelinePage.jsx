@@ -30,6 +30,9 @@ export default function PipelinePage() {
   const [costs, setCosts] = useState(settings.transactionCost);
   const [slip, setSlip] = useState(settings.slippage);
   const [symbol, setSymbol] = useState('AAPL');
+  const [maxPos, setMaxPos] = useState(1);
+  const [stopPct, setStopPct] = useState(10);
+  const [regimeOff, setRegimeOff] = useState(true);
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState(-1);
   const [result, setResult] = useState(null);
@@ -45,7 +48,7 @@ export default function PipelinePage() {
       await new Promise((r) => setTimeout(r, 420));
     }
     try {
-      const out = await runPipeline(hyp, Number(costs), Number(slip), symbol.trim().toUpperCase());
+      const out = await runPipeline(hyp, Number(costs), Number(slip), symbol.trim().toUpperCase(), { max_pos: Number(maxPos), stop_pct: Number(stopPct), regime_off: regimeOff });
       setResult(out);
       setPhase(LOOP.length);
       toast.success(`Cycle complete → ${out.status}`);
@@ -96,9 +99,26 @@ export default function PipelinePage() {
             <Field label="Slippage (bps)" hint="Added on top of costs">
               <input className="pv-input" type="number" min="0" max="500" value={slip} onChange={(e) => setSlip(e.target.value)} />
             </Field>
-            <Field label="Live symbol" hint="Real bars, keyless feed · blank = synthetic lab">
+            <Field label="Live symbol" hint="AUTO scans SPY·AAPL·MSFT·NVDA·TSLA · blank = synthetic lab">
               <input className="pv-input" value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())} placeholder="AAPL" maxLength={12} style={{ fontFamily: 'var(--font-mono)' }} />
             </Field>
+            <Field label="Max position" hint="Cap 0.1 – 1.0">
+              <input className="pv-input" type="number" min="0.1" max="1" step="0.1" value={maxPos} onChange={(e) => setMaxPos(e.target.value)} />
+            </Field>
+            <Field label="Stop-loss %" hint="Trailing stop, 0 = off">
+              <input className="pv-input" type="number" min="0" max="50" step="1" value={stopPct} onChange={(e) => setStopPct(e.target.value)} />
+            </Field>
+          </div>
+
+          <div style={{ display: 'flex', gap: '.4rem', flexWrap: 'wrap', marginTop: '.6rem' }}>
+            {['AUTO', 'AAPL', 'SPY', 'MSFT', 'NVDA', 'TSLA'].map((s) => (
+              <button key={s} type="button" className={`ui-pill ${symbol === s ? 'is-ok' : 'is-quiet'}`}
+                style={{ fontSize: '.7rem', cursor: 'pointer' }} onClick={() => setSymbol(s)}>{s}</button>
+            ))}
+            <button type="button" className={`ui-pill ${regimeOff ? 'is-ok' : 'is-quiet'}`}
+              style={{ fontSize: '.7rem', cursor: 'pointer' }} onClick={() => setRegimeOff(!regimeOff)}>
+              regime filter {regimeOff ? 'ON' : 'OFF'}
+            </button>
           </div>
 
           <button className="pv-btn pv-btn-primary pv-btn-block" style={{ marginTop: '1rem' }} onClick={run} disabled={running}>
@@ -188,6 +208,17 @@ export default function PipelinePage() {
                   <KpiGrid>
                     <Kpi label="Train Sharpe" value={fmt.num(result.learning.train?.sharpe)} foot={`${result.learning.train_bars} bars · selected here`} />
                     <Kpi label="Test Sharpe" value={fmt.num(m?.sharpe)} foot={`${result.learning.test_bars} bars · never seen in training`} tone={m?.sharpe >= 1 ? 'tone-ok' : 'tone-warn'} />
+                  </KpiGrid>
+                </div>
+              )}
+
+              {result.learning?.scan?.length > 1 && (
+                <div>
+                  <div className="ui-eyebrow" style={{ marginBottom: '.45rem' }}>Universe scan · best test kept</div>
+                  <KpiGrid>
+                    {result.learning.scan.filter((s) => !s.error).map((s) => (
+                      <Kpi key={s.symbol} label={s.symbol} value={fmt.num(s.test_sharpe)} foot={`${s.winner} · train ${fmt.num(s.train_sharpe)}`} tone={s.test_sharpe >= 1 ? 'tone-ok' : 'tone-warn'} />
+                    ))}
                   </KpiGrid>
                 </div>
               )}

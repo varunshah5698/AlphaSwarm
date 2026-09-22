@@ -109,15 +109,67 @@ def eval_signal(formula: str, df: pd.DataFrame) -> pd.Series:
     return sig.clip(-3, 3)
 
 
-def _run_backtest(df: pd.DataFrame, formula: str, costs_bps: int, slippage_bps: int, bars_per_year: int = 252):
+def _positions_and_costs(df: pd.DataFrame, formula: str, costs_bps: int, slippage_bps: int,
+                         max_pos: float = 1.0, stop_pct: float = 10.0,
+                         regime_off: bool = True, slip_vol_mult: float = 1.0):
+    """Shared accounting core: signal → risk overlays → per-bar costs.
+
+    Overlays (all use past data only, no look-ahead):
+    - cap: positions scaled to [-max_pos, max_pos].
+    - regime filter: when 20-day vol exceeds 1.5x its 1-year baseline (as known
+      at decision time), stand aside that bar.
+    - stop-loss: trailing stop_pct% on gross equity; flat until a new high.
+    Slippage grows with that bar's high-low range (real fills gap on wild days).
+    """
     sig = eval_signal(formula, df)
-    pos = sig.shift(1).fillna(0)  # no look-ahead: trade next bar
-    # scale position to [-1, 1]
-    pos = (pos / 3).clip(-1, 1)
+    pos = ((sig.shift(1).fillna(0) / 3).clip(-1, 1) * max_pos).clip(-1, 1)
+    ret = df["close"].pct_change().fillna(0)
+    if regime_off and len(df) > 25:
+        vol = ret.rolling(20).std()
+        baseline = vol.rolling(252, min_periods=20).mean()
+        calm = (vol <= 1.5 * baseline).fillna(True).to_numpy(dtype=bool)
+        # shift with fill keeps bool dtype (plain .shift would upcast to object)
+        tradable = np.empty(len(df), dtype=bool)
+        tradable[0] = False
+        tradable[1:] = calm[:-1]
+        pos = pos.mask(~tradable, 0.0)
+    if stop_pct > 0 and len(df) > 2:
+        gross = (pos * ret).to_numpy()
+        # trailing stop on gross equity (flat until a new high after stopping)
+        eq = np.empty(len(gross))
+        eq[0] = 1 + gross[0]
+        for i in range(1, len(gross)):
+            eq[i] = eq[i - 1] * (1 + gross[i])
+        out = pos.to_numpy().copy()
+        peak = eq[0]
+        stopped = False
+        for i in range(len(eq)):
+            peak = max(peak, eq[i])
+            if not stopped and peak and (eq[i] / peak - 1) * 100 < -stop_pct:
+                stopped = True
+            if stopped:
+                out[i] = 0.0
+                if eq[i] >= peak:
+                    stopped = False
+                    peak = eq[i]
+        pos = pd.Series(out, index=df.index)
+    turnover = pos.diff().abs().fillna(0)
+    rng = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
+    # ~1% of the bar's range as extra slippage (a 2% daily range ≈ 20bps).
+    # Calibrated so liquid large-caps pay single-digit bps, wild days pay more.
+    extra_slip = (slip_vol_mult * rng * 10000 * 0.01).fillna(0)
+    cost = (costs_bps + slippage_bps + extra_slip) / 10000.0
+    strat_ret = pos * ret - turnover * cost
+    return pos, strat_ret
+
+
+def _run_backtest(df: pd.DataFrame, formula: str, costs_bps: int, slippage_bps: int, bars_per_year: int = 252,
+                  max_pos: float = 1.0, stop_pct: float = 10.0,
+                  regime_off: bool = True, slip_vol_mult: float = 1.0):
+    pos, strat_ret = _positions_and_costs(df, formula, costs_bps, slippage_bps,
+                                            max_pos, stop_pct, regime_off, slip_vol_mult)
     ret = df["close"].pct_change().fillna(0)
     turnover = pos.diff().abs().fillna(0)
-    cost = (costs_bps + slippage_bps) / 10000.0
-    strat_ret = pos * ret - turnover * cost
     equity = (1 + strat_ret).cumprod()
     total_ret = (equity.iloc[-1] - 1) * 100
     vol = strat_ret.std() * np.sqrt(bars_per_year) * 100
@@ -289,13 +341,13 @@ def train_test_split(df: pd.DataFrame, test_frac: float = 0.3):
 
 
 def evaluate_oos(df: pd.DataFrame, formula: str, costs_bps: int = 10, slippage_bps: int = 5,
-                 test_frac: float = 0.3) -> dict:
+                 test_frac: float = 0.3, risk: dict | None = None) -> dict:
     """Same formula on train vs unseen test. The gap between the two is the
     honesty metric: a big train/test Sharpe gap means overfit."""
     tr, te = train_test_split(df, test_frac)
     return {
-        "train": _run_backtest(tr, formula, costs_bps, slippage_bps),
-        "test": _run_backtest(te, formula, costs_bps, slippage_bps),
+        "train": _run_backtest(tr, formula, costs_bps, slippage_bps, **(risk or {})),
+        "test": _run_backtest(te, formula, costs_bps, slippage_bps, **(risk or {})),
         "train_bars": len(tr),
         "test_bars": len(te),
     }
@@ -354,13 +406,13 @@ def _enumerate_candidates(max_candidates: int = 150) -> list:
 
 
 def _select_best(cands: list, tr: pd.DataFrame, costs_bps: int, slippage_bps: int,
-                 penalty: float = 0.03) -> list:
+                 penalty: float = 0.03, risk: dict | None = None) -> list:
     """Score every candidate on a training slice. Returns ranked
     [(score, family, formula, metrics)] — selection never sees test data."""
     scored = []
     for family, f in cands:
         try:
-            m = _run_backtest(tr, f, costs_bps, slippage_bps)
+            m = _run_backtest(tr, f, costs_bps, slippage_bps, **(risk or {}))
             if m["trades"] < 20:
                 continue  # degenerate: barely trades
             score = m["sharpe"] - penalty * _count_ops(f)
@@ -371,8 +423,31 @@ def _select_best(cands: list, tr: pd.DataFrame, costs_bps: int, slippage_bps: in
     return scored
 
 
+def paper_backfill(df: pd.DataFrame, formula: str, costs_bps: int = 10, slippage_bps: int = 5,
+                   start_idx: int = 60, max_pos: float = 1.0, stop_pct: float = 10.0,
+                   regime_off: bool = True, slip_vol_mult: float = 1.0) -> list:
+    """Day-by-day paper ledger with EXACTLY the backtest's accounting
+    (same shared core: overlays + vol-scaled costs). Paper equity from bar k
+    must equal backtest equity[k:] ratios — verified in tests, not by faith."""
+    pos, strat_ret = _positions_and_costs(df, formula, costs_bps, slippage_bps,
+                                          max_pos, stop_pct, regime_off, slip_vol_mult)
+    dates = df["date"] if "date" in df.columns else pd.Series([str(i) for i in range(len(df))])
+    rows = []
+    cap = 1.0
+    base = float(df["close"].iloc[start_idx])
+    for i in range(start_idx, len(df)):
+        cap *= (1 + float(strat_ret.iloc[i]))
+        rows.append({"date": str(dates.iloc[i]),
+                     "equity": round(cap, 6),
+                     "benchmark": round(float(df["close"].iloc[i] / base), 6),
+                     "position": round(float(pos.iloc[i]), 4),
+                     "price": round(float(df["close"].iloc[i]), 2),
+                     "ret": round(float(strat_ret.iloc[i]) * 100, 4)})
+    return rows
+
+
 def walk_forward(df: pd.DataFrame, costs_bps: int = 10, slippage_bps: int = 5,
-                 folds: int = 3, penalty: float = 0.03) -> dict:
+                 folds: int = 3, penalty: float = 0.03, risk: dict | None = None) -> dict:
     """Re-select the winner on an expanding training window and test each on
     the next unseen block. Consistent winners across folds = robust pattern;
     winners that only work once = luck. This is the closest thing to
@@ -384,11 +459,11 @@ def walk_forward(df: pd.DataFrame, costs_bps: int = 10, slippage_bps: int = 5,
     for k in range(1, folds + 1):
         tr = df.iloc[:edges[k]].reset_index(drop=True)
         te = df.iloc[edges[k]:edges[k + 1]].reset_index(drop=True)
-        ranked = _select_best(cands, tr, costs_bps, slippage_bps, penalty)
+        ranked = _select_best(cands, tr, costs_bps, slippage_bps, penalty, risk)
         if not ranked:
             continue
         _, family, formula, train_m = ranked[0]
-        test_m = _run_backtest(te, formula, costs_bps, slippage_bps)
+        test_m = _run_backtest(te, formula, costs_bps, slippage_bps, **(risk or {}))
         results.append({"fold": k, "train_bars": len(tr), "test_bars": len(te),
                         "winner": family, "formula": formula,
                         "train_sharpe": train_m["sharpe"], "test_sharpe": test_m["sharpe"],
@@ -399,20 +474,22 @@ def walk_forward(df: pd.DataFrame, costs_bps: int = 10, slippage_bps: int = 5,
             "positive_folds": sum(1 for t in tests if t > 0),
             "n_folds": len(results)}
 def learn(df: pd.DataFrame, hypothesis: str = "", costs_bps: int = 10, slippage_bps: int = 5,
-          test_frac: float = 0.3, penalty: float = 0.03, max_candidates: int = 150) -> dict:
+          test_frac: float = 0.3, penalty: float = 0.03, max_candidates: int = 150,
+          risk: dict | None = None) -> dict:
     """Genuine model selection: enumerate the candidate space, score each on
     TRAIN only (Sharpe minus a per-op complexity penalty), report the winner
     on the unseen TEST segment, then stress it with walk-forward folds.
-    Headline metrics are always test."""
+    Headline metrics are always test. Risk overlays apply identically in
+    selection and in paper trading — no bait and switch."""
     tr, te = train_test_split(df, test_frac)
     cands = _enumerate_candidates(max_candidates)
-    scored = _select_best(cands, tr, costs_bps, slippage_bps, penalty)
+    scored = _select_best(cands, tr, costs_bps, slippage_bps, penalty, risk)
     if not scored:
         raise ValueError("Learning found no viable candidate on the training segment.")
     score, family, formula, train_m = scored[0]
-    test_m = _run_backtest(te, formula, costs_bps, slippage_bps)
-    full_m = _run_backtest(df, formula, costs_bps, slippage_bps)
-    wf = walk_forward(df, costs_bps, slippage_bps, penalty=penalty)
+    test_m = _run_backtest(te, formula, costs_bps, slippage_bps, **(risk or {}))
+    full_m = _run_backtest(df, formula, costs_bps, slippage_bps, **(risk or {}))
+    wf = walk_forward(df, costs_bps, slippage_bps, penalty=penalty, risk=risk)
     code = (
         f"# {family} (learned) — train Sharpe {train_m['sharpe']}, test Sharpe {test_m['sharpe']}\n"
         f"# hypothesis: {hypothesis}\n"
@@ -423,7 +500,7 @@ def learn(df: pd.DataFrame, hypothesis: str = "", costs_bps: int = 10, slippage_
     )
     return {"name": f"{family} ·learned", "formula": formula, "code": code,
             "train": train_m, "test": test_m, "full": full_m,
-            "walk_forward": wf,
+            "walk_forward": wf, "risk": risk or {},
             "train_bars": len(tr), "test_bars": len(te),
             "candidates": len(cands), "viable": len(scored),
             "selection_score": round(score, 3)}

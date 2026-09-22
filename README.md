@@ -27,9 +27,13 @@ The image builds the React bundle inside Docker — no local `dist/` needed.
 1. Render dashboard → New → **Web Service** → select `varunshah5698/AlphaSwarm`
 2. **Runtime: Docker** (NOT Node — Node builds only the UI and the API stays dead,
    which is exactly the `vite: not found` failure: dependencies were never installed)
-3. Add env vars: `SESSION_TTL_DAYS=7`, `FINNHUB_API_KEY=<your key>`
+3. Add env vars: `SESSION_TTL_DAYS=7`, `FINNHUB_API_KEY=<your key>` (optional fallback feed —
+   market data is keyless via Yahoo by default), `CRON_SECRET=<long random string>` (for daily paper fills)
    (Render injects `$PORT` itself; the server listens on it automatically)
 4. Deploy → one URL serves the full app + API + docs.
+5. Daily paper fills (automatic): Render dashboard → New → **Cron Job** → same repo,
+   command `curl -s "https://<your-service>.onrender.com/api/paper/run?symbol=AAPL&cron_secret=<CRON_SECRET>"`,
+   schedule `30 21 * * 1-5` (after US close, weekdays). Repeat per symbol (SPY, MSFT, NVDA, TSLA).
 > Do NOT use Render's Node runtime for this repo: `npm run build` alone fails
 > without `npm ci` first, and even then the Python API would be missing.
 

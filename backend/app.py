@@ -26,7 +26,7 @@ init_db()
 try:
     _c = conn()
     _cols = [r["name"] for r in _c.execute("PRAGMA table_info(strategies)").fetchall()]
-    _rows = _c.execute("SELECT id, formula, judge_score, dataset" if "dataset" in _cols else "SELECT id, formula, judge_score").fetchall()
+    _rows = _c.execute("SELECT id, formula, judge_score, dataset FROM strategies" if "dataset" in _cols else "SELECT id, formula, judge_score FROM strategies").fetchall()
     for _r in _rows:
         try:
             _ds = _r["dataset"] if "dataset" in _cols else ""
@@ -140,12 +140,18 @@ class PipelineIn(BaseModel):
     costs_bps: int = Field(default=10, ge=0, le=500)
     slippage_bps: int = Field(default=5, ge=0, le=500)
     symbol: str = Field(default="AAPL", max_length=12)  # single-stock focus; "" = synthetic lab data
+    max_pos: float = Field(default=1.0, ge=0.1, le=1.0)  # position cap
+    stop_pct: float = Field(default=10.0, ge=0.0, le=50.0)  # trailing stop %, 0 = off
+    regime_off: bool = True  # stand aside when vol spikes
 
 class BacktestIn(BaseModel):
     formula: str = Field(max_length=500)
     costs_bps: int = Field(default=10, ge=0, le=500)
     slippage_bps: int = Field(default=5, ge=0, le=500)
     symbol: str = Field(default="", max_length=12)  # optional: real bars + train/test report
+    max_pos: float = Field(default=1.0, ge=0.1, le=1.0)
+    stop_pct: float = Field(default=10.0, ge=0.0, le=50.0)
+    regime_off: bool = True
 
 class LiveBacktestIn(BacktestIn):
     symbol: str = Field(max_length=12)
@@ -155,6 +161,15 @@ class TestAllIn(BaseModel):
     symbol: str = Field(max_length=12)
     costs_bps: int = Field(default=10, ge=0, le=500)
     slippage_bps: int = Field(default=5, ge=0, le=500)
+    max_pos: float = Field(default=1.0, ge=0.1, le=1.0)
+    stop_pct: float = Field(default=10.0, ge=0.0, le=50.0)
+    regime_off: bool = True
+
+
+def _risk_of(p) -> dict:
+    """Risk overlay params shared by selection, backtests and paper trading."""
+    return {"max_pos": float(p.max_pos), "stop_pct": float(p.stop_pct),
+            "regime_off": bool(p.regime_off), "slip_vol_mult": 1.0}
 
 class PaperPatch(BaseModel):
     status: str | None = None
@@ -678,18 +693,37 @@ def pipeline_run(p: PipelineIn, authorization: str | None = Header(default=None)
     if symbol:
         # Learn on real market data: search the candidate space on a training
         # segment, select there, report on unseen test bars. Headline = test.
-        try:
-            sym, df, source = _get_live_bars(symbol)
-        except HTTPException as e:
-            log("Data Ingestion", f"Live bars failed for {symbol}: {e.detail}", "error")
-            raise
+        # symbol=AUTO scans the whole universe and keeps the best test result.
+        targets = UNIVERSE if symbol == "AUTO" else [symbol]
+        scans = []
+        for tgt in targets:
+            try:
+                s2, df2, src2 = _get_live_bars(tgt)
+            except HTTPException as e:
+                log("Data Ingestion", f"Live bars failed for {tgt}: {e.detail}", "error")
+                if len(targets) == 1:
+                    raise
+                scans.append({"symbol": tgt, "error": str(e.detail)[:120]})
+                continue
+            log("Data Ingestion", f"Loaded {src2} {s2}: {len(df2)} daily bars")
+            try:
+                res2 = learn(df2, p.hypothesis, p.costs_bps, p.slippage_bps, risk=_risk_of(p))
+            except Exception as e:
+                log("Backtest Engine", f"Learning failed on {s2}: {e}", "error")
+                if len(targets) == 1:
+                    raise HTTPException(400, f"Learning failed: {e}")
+                scans.append({"symbol": s2, "error": str(e)[:120]})
+                continue
+            scans.append({"symbol": s2, "source": src2, "bars": len(df2),
+                          "winner": res2["name"], "formula": res2["formula"],
+                          "train_sharpe": res2["train"]["sharpe"], "test_sharpe": res2["test"]["sharpe"],
+                          "res": res2, "df": df2})
+        ok = [s for s in scans if "res" in s]
+        if not ok:
+            raise HTTPException(503, "No symbol in the universe returned usable bars.")
+        best = max(ok, key=lambda s: s["test_sharpe"])
+        sym, df, source, res = best["symbol"], best["df"], best["source"], best["res"]
         dataset = f"LIVE-{sym}"
-        log("Data Ingestion", f"Loaded {source} {sym}: {len(df)} daily bars")
-        try:
-            res = learn(df, p.hypothesis, p.costs_bps, p.slippage_bps)
-        except Exception as e:
-            log("Backtest Engine", f"Learning failed: {e}", "error")
-            raise HTTPException(400, f"Learning failed: {e}")
         w = {"name": res["name"], "formula": res["formula"], "code": res["code"]}
         log("Writer Agent", f"Learned {res['candidates']} candidates, {res['viable']} viable — winner: {res['formula']}")
         j = judge_review(res["formula"], p.hypothesis)
@@ -703,7 +737,8 @@ def pipeline_run(p: PipelineIn, authorization: str | None = Header(default=None)
         learning = {"source": source, "symbol": sym, "dataset": dataset,
                     "candidates": res["candidates"], "viable": res["viable"],
                     "train": t, "test_bars": res["test_bars"], "train_bars": res["train_bars"],
-                    "walk_forward": wf,
+                    "walk_forward": wf, "risk": res.get("risk", {}),
+                    "scan": [{k: s[k] for k in ("symbol", "source", "bars", "winner", "train_sharpe", "test_sharpe", "error") if k in s} for s in scans],
                     "selection_score": res["selection_score"]}
         c = conn()
         cur = c.execute(
@@ -723,7 +758,7 @@ def pipeline_run(p: PipelineIn, authorization: str | None = Header(default=None)
     lvl = "success" if j["verdict"] == "approve" else ("warn" if j["verdict"] == "revise" else "error")
     log("Judge Agent", f"Verdict={j['verdict']} score={j['score']}: {j['notes']}", lvl)
     try:
-        m = backtest(w["formula"], p.costs_bps, p.slippage_bps)
+        m = _run_backtest(make_market(), w["formula"], p.costs_bps, p.slippage_bps, **_risk_of(p))
     except Exception as e:
         log("Backtest Engine", f"Backtest failed: {e}", "error")
         raise HTTPException(400, f"Backtest failed: {e}")
@@ -751,8 +786,8 @@ def run_backtest(b: BacktestIn, authorization: str | None = Header(default=None)
     try:
         if symbol:
             sym, df, source = _get_live_bars(symbol)
-            out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps)
-            oos = evaluate_oos(df, b.formula, b.costs_bps, b.slippage_bps)
+            out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps, **_risk_of(b))
+            oos = evaluate_oos(df, b.formula, b.costs_bps, b.slippage_bps, risk=_risk_of(b))
             out["dataset"] = f"YAHOO-{sym}" if source.startswith("Yahoo") else f"LIVE-{sym}"
             out["symbol"] = sym
             out["train"] = oos["train"]
@@ -762,8 +797,8 @@ def run_backtest(b: BacktestIn, authorization: str | None = Header(default=None)
             log("Backtest Engine", f"Backtest by {u['username']}: {sym} train Sharpe={oos['train']['sharpe']} test Sharpe={oos['test']['sharpe']}")
             return out
         df = make_market()
-        out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps)
-        oos = evaluate_oos(df, b.formula, b.costs_bps, b.slippage_bps)
+        out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps, **_risk_of(b))
+        oos = evaluate_oos(df, b.formula, b.costs_bps, b.slippage_bps, risk=_risk_of(b))
         out["train"] = oos["train"]
         out["test"] = oos["test"]
         out["train_bars"] = oos["train_bars"]
@@ -810,7 +845,7 @@ def run_backtest_live(b: LiveBacktestIn, authorization: str | None = Header(defa
     _check_rate(f"backtest:{u['id']}", 20, 60)
     try:
         sym, df, source = _get_live_bars(b.symbol, years=b.years)
-        out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps)
+        out = _run_backtest(df, b.formula, b.costs_bps, b.slippage_bps, **_risk_of(b))
         out["dataset"] = f"LIVE-{sym}"
         out["symbol"] = sym
     except HTTPException:
@@ -839,7 +874,7 @@ def test_all_strategies(b: TestAllIn, authorization: str | None = Header(default
     results = []
     for s in strats[:25]:
         try:
-            m = _run_backtest(df, s["formula"], b.costs_bps, b.slippage_bps)
+            m = _run_backtest(df, s["formula"], b.costs_bps, b.slippage_bps, **_risk_of(b))
             results.append({"id": s["id"], "name": s["name"], "formula": s["formula"],
                             "sharpe": m["sharpe"], "returns": m["returns"], "max_dd": m["max_dd"],
                             "win_rate": m["win_rate"], "trades": m["trades"],
@@ -849,6 +884,199 @@ def test_all_strategies(b: TestAllIn, authorization: str | None = Header(default
     results.sort(key=lambda r: r.get("sharpe", -99), reverse=True)
     log("Backtest Engine", f"Test-all by {u['username']}: {symbol} via {source} ({len(results)} strategies)")
     return {"symbol": symbol, "bars": len(df), "source": source, "results": results}
+
+# ---------- paper trading: forward track record, one honest day at a time ----------
+UNIVERSE = ["SPY", "AAPL", "MSFT", "NVDA", "TSLA"]
+
+
+def _paper_pick_strategy(symbol: str):
+    """Prefer a factor learned on this symbol, else any LIVE active, else best."""
+    c = conn()
+    rows = [dict(r) for r in c.execute("SELECT * FROM strategies").fetchall()]
+    c.close()
+    if not rows:
+        return None
+    same = [s for s in rows if s.get("dataset") == f"LIVE-{symbol}" and s["status"] == "active"]
+    live = [s for s in rows if (s.get("dataset") or "").startswith("LIVE-") and s["status"] == "active"]
+    pool = same or live or [s for s in rows if s["status"] == "active"] or rows
+    return max(pool, key=lambda s: s["sharpe"])
+
+
+def _paper_account(symbol: str):
+    c = conn()
+    row = c.execute("SELECT * FROM paper_account WHERE symbol=?", (symbol,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def _paper_accounts() -> list:
+    c = conn()
+    rows = [dict(r) for r in c.execute("SELECT symbol, strategy_id, last_date, updated_at FROM paper_account ORDER BY symbol").fetchall()]
+    c.close()
+    return rows
+
+
+def _paper_stats(daily: list) -> dict:
+    import math
+    if not daily:
+        return {"days": 0, "return": 0.0, "sharpe": 0.0, "max_dd": 0.0,
+                "bench_return": 0.0, "excess": 0.0, "win_rate": 0.0}
+    eq = [r["equity"] for r in daily]
+    rets = [(eq[i] / eq[i - 1] - 1) for i in range(1, len(eq)) if eq[i - 1]]
+    total = (eq[-1] / eq[0] - 1) * 100
+    peak, dd = eq[0], 0.0
+    for v in eq:
+        peak = max(peak, v)
+        if peak:
+            dd = min(dd, (v / peak - 1) * 100)
+    if rets:
+        mu = sum(rets) / len(rets)
+        var = sum((x - mu) ** 2 for x in rets) / len(rets)
+        sd = math.sqrt(var) if var > 0 else 1e-9
+        sharpe = mu / sd * math.sqrt(252)
+    else:
+        sharpe = 0.0
+    moved = [r["ret"] for r in daily if r["ret"] != 0]
+    win = sum(1 for r in moved if r > 0) / len(moved) * 100 if moved else 0.0
+    bench = (daily[-1]["benchmark"] / daily[0]["benchmark"] - 1) * 100 if daily[0]["benchmark"] else 0.0
+    return {"days": len(daily), "return": round(total, 2), "sharpe": round(sharpe, 2),
+            "max_dd": round(dd, 2), "bench_return": round(bench, 2),
+            "excess": round(total - bench, 2), "win_rate": round(win, 1)}
+
+
+def _paper_status_payload(symbol: str):
+    acc = _paper_account(symbol)
+    if not acc:
+        return {"account": None, "daily": [], "recent": [], "stats": _paper_stats([]),
+                "accounts": _paper_accounts(), "universe": UNIVERSE}
+    c = conn()
+    rows = [dict(r) for r in c.execute("SELECT * FROM paper_daily WHERE symbol=? ORDER BY date", (symbol,)).fetchall()]
+    strat = c.execute("SELECT id, name, formula, dataset, sharpe FROM strategies WHERE id=?", (acc["strategy_id"],)).fetchone()
+    c.close()
+    step = max(1, len(rows) // 500)
+    return {"account": {**acc, "strategy": dict(strat) if strat else None},
+            "daily": [{"date": r["date"], "equity": r["equity"], "benchmark": r["benchmark"]} for r in rows[::step]],
+            "recent": rows[-10:][::-1],
+            "stats": _paper_stats(rows),
+            "accounts": _paper_accounts(), "universe": UNIVERSE}
+
+
+def _cron_or_user(authorization: str | None, cron_secret: str | None, scope: str):
+    """Render Cron Job support: ?cron_secret= matches env CRON_SECRET, no login.
+    Otherwise normal bearer auth + rate limit."""
+    if cron_secret and os.environ.get("CRON_SECRET") and cron_secret == os.environ["CRON_SECRET"]:
+        return {"id": 0, "username": "cron"}
+    u = _require_user(authorization)
+    _check_rate(f"{scope}:{u['id']}", 6, 60)
+    return u
+
+
+@app.get("/api/paper")
+def paper_status(symbol: str = "AAPL", authorization: str | None = Header(default=None)):
+    """Paper scoreboard for one symbol: forward equity vs buy-and-hold."""
+    _require_user(authorization)
+    return _paper_status_payload(symbol.strip().upper()[:12] or "AAPL")
+
+
+@app.post("/api/paper/run")
+def paper_run(symbol: str = "AAPL", cron_secret: str | None = None, authorization: str | None = Header(default=None)):
+    """Backfill one symbol's ledger to the latest bar. Run daily (button or cron)."""
+    u = _cron_or_user(authorization, cron_secret, "paper")
+    from quant import paper_backfill
+    sym = (symbol or "AAPL").strip().upper()[:12] or "AAPL"
+    acc = _paper_account(sym)
+    if not acc:
+        s = _paper_pick_strategy(sym)
+        if not s:
+            raise HTTPException(400, "No strategies yet — run the pipeline first.")
+        c = conn()
+        c.execute("INSERT INTO paper_account (symbol, strategy_id) VALUES (?,?)", (sym, s["id"]))
+        c.commit(); c.close()
+        log("Paper Trader", f"Paper account opened on {s['name']} ({sym})")
+        acc = _paper_account(sym)
+    c = conn()
+    strat = c.execute("SELECT * FROM strategies WHERE id=?", (acc["strategy_id"],)).fetchone()
+    c.close()
+    if not strat:
+        raise HTTPException(400, "Paper strategy no longer exists — retrain to pick a new one.")
+    strat = dict(strat)
+    try:
+        sym, df, source = _get_live_bars(sym)
+    except HTTPException as e:
+        raise
+    risk = {"max_pos": acc["max_pos"], "stop_pct": acc["stop_pct"],
+            "regime_off": bool(acc["regime_off"]), "slip_vol_mult": 1.0}
+    rows = paper_backfill(df, strat["formula"], acc["costs_bps"], acc["slippage_bps"], **risk)
+    fresh = [r for r in rows if r["date"] > (acc["last_date"] or "")]
+    c = conn()
+    for r in fresh:
+        c.execute("INSERT OR REPLACE INTO paper_daily (symbol, date, equity, benchmark, position, price, ret) VALUES (?,?,?,?,?,?,?)",
+                  (sym, r["date"], r["equity"], r["benchmark"], r["position"], r["price"], r["ret"]))
+    if rows:
+        last = rows[-1]
+        c.execute("UPDATE paper_account SET capital=?, position=?, last_date=?, updated_at=datetime('now') WHERE symbol=?",
+                  (last["equity"], last["position"], last["date"], sym))
+    c.commit(); c.close()
+    if fresh:
+        log("Paper Trader", f"{sym} ledger to {rows[-1]['date']}: {len(fresh)} new fills, equity {rows[-1]['equity']:.4f} vs BH {rows[-1]['benchmark']:.4f}")
+    payload = _paper_status_payload(sym)
+    payload["filled"] = len(fresh)
+    payload["source"] = source
+    return payload
+
+
+@app.post("/api/paper/retrain")
+def paper_retrain(symbol: str = "AAPL", authorization: str | None = Header(default=None)):
+    """Re-learn on the extended history; promote the challenger only if it
+    beats the incumbent out-of-sample by a clear margin (anti-churn)."""
+    u = _require_user(authorization)
+    _check_rate(f"retrain:{u['id']}", 2, 60)
+    sym = (symbol or "AAPL").strip().upper()[:12] or "AAPL"
+    acc = _paper_account(sym)
+    if not acc:
+        raise HTTPException(400, "No paper account yet — run the paper ledger first.")
+    c = conn()
+    strat = c.execute("SELECT * FROM strategies WHERE id=?", (acc["strategy_id"],)).fetchone()
+    c.close()
+    if not strat:
+        raise HTTPException(400, "Paper strategy no longer exists.")
+    strat = dict(strat)
+    try:
+        sym, df, source = _get_live_bars(sym)
+    except HTTPException as e:
+        raise
+    risk = {"max_pos": acc["max_pos"], "stop_pct": acc["stop_pct"],
+            "regime_off": bool(acc["regime_off"]), "slip_vol_mult": 1.0}
+    res = learn(df, strat.get("hypothesis") or "", acc["costs_bps"], acc["slippage_bps"], risk=risk)
+    inc_oos = evaluate_oos(df, strat["formula"], acc["costs_bps"], acc["slippage_bps"], risk=risk)
+    inc_test = inc_oos["test"]["sharpe"]
+    chal_test = res["test"]["sharpe"]
+    promoted = bool(chal_test >= 0.4 and chal_test > inc_test + 0.2)
+    out = {"incumbent": {"name": strat["name"], "formula": strat["formula"], "test_sharpe": inc_test},
+           "challenger": {"name": res["name"], "formula": res["formula"], "test_sharpe": chal_test,
+                          "train_sharpe": res["train"]["sharpe"],
+                          "walk_forward": res["walk_forward"], "candidates": res["candidates"]},
+           "promoted": promoted, "source": source}
+    if promoted:
+        j = judge_review(res["formula"], strat.get("hypothesis") or "")
+        m = res["test"]
+        c = conn()
+        cur = c.execute(
+            "INSERT INTO strategies (name, hypothesis, formula, code, status, sharpe, returns, max_dd, win_rate, trades, author, judge_notes, judge_score, ann_vol, equity, dataset) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (res["name"], strat.get("hypothesis") or "", res["formula"], res["code"],
+             "active" if j["verdict"] == "approve" else "testing",
+             m["sharpe"], m["returns"], m["max_dd"], m["win_rate"], m["trades"],
+             "Writer Agent", j["notes"], j["score"], m.get("ann_vol", 0),
+             json.dumps(res["full"]["equity_curve"]), f"LIVE-{sym}"))
+        nid = cur.lastrowid
+        c.execute("UPDATE paper_account SET strategy_id=?, updated_at=datetime('now') WHERE symbol=?", (nid, sym))
+        c.commit(); c.close()
+        log("Paper Trader", f"Retrain promoted #{nid} {res['name']}: test {inc_test} → {chal_test}", "success")
+        out["strategy_id"] = nid
+    else:
+        log("Paper Trader", f"Retrain kept incumbent: challenger test {chal_test} vs {inc_test} — margin too thin")
+    return out
+
 
 # ---------- live market (Finnhub, key stays server-side) ----------
 @app.get("/api/market/live")

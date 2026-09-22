@@ -84,7 +84,13 @@ def _download(symbol: str, years: float) -> dict:
         except urllib.error.HTTPError as e:
             last_err = f"Yahoo feed HTTP {e.code}"
             if e.code == 429:
-                time.sleep(3 + 5 * attempt)
+                import random
+                retry_after = 0
+                try:
+                    retry_after = float(e.headers.get("Retry-After") or 0)
+                except Exception:
+                    retry_after = 0
+                time.sleep(min(retry_after or (10 + 15 * attempt + random.uniform(0, 5)), 90))
                 continue
             raise ConnectionError(f"Market feed unreachable: HTTP Error {e.code}")
         except Exception as e:

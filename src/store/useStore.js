@@ -119,8 +119,8 @@ export const useStore = create((set, get) => ({
     set((st) => ({ strategies: st.strategies.filter(s => s.id !== id) }));
   },
 
-  runPipeline: async (hypothesis, costs_bps = 10, slippage_bps = 5, symbol = "") => {
-    const out = await api.runPipeline({ hypothesis, costs_bps, slippage_bps, symbol });
+  runPipeline: async (hypothesis, costs_bps = 10, slippage_bps = 5, symbol = "", risk = {}) => {
+    const out = await api.runPipeline({ hypothesis, costs_bps, slippage_bps, symbol, ...risk });
     await get().refresh();
     return out;
   },
